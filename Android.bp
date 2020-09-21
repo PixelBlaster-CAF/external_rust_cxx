@@ -1,0 +1,40 @@
+rust_library {
+    name: "libcxx",
+    crate_name: "cxx",
+    srcs: ["src/lib.rs"],
+    edition: "2018",
+    rustlibs: [
+        "libanyhow",
+        "libthiserror",
+    ],
+    proc_macros: [
+        "libcxxbridge_macro",
+    ],
+    static_libs: [
+        "libcxxbridge03",
+    ],
+    shared_libs: ["libc++"],
+}
+
+cc_library_static {
+    host_supported: true,
+    name: "libcxxbridge03",
+    cflags: ["-DRUST_CXX_NO_EXCEPTIONS"],
+    srcs: ["src/cxx.cc"]
+}
+
+cc_library_static {
+    host_supported: true,
+    name: "libcxx-demo-cxx",
+    srcs: ["demo-cxx/demo.cc"],
+    local_include_dirs: ["demo-cxx"],
+    generated_headers: ["cxx-demo-bridge-header", "cxx-bridge-header"],
+    generated_sources: ["cxx-demo-bridge-code"],
+}
+
+genrule {
+    name: "cxx-bridge-header",
+    tools: ["cxxbridge"],
+    cmd: "$(location cxxbridge) --header > $(out)",
+    out: ["rust/cxx.h"],
+}
