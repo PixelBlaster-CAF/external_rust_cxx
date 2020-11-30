@@ -6,12 +6,11 @@ rust_binary_host {
     srcs: ["src/main.rs"],
     edition: "2018",
     rustlibs: [
-        "libanyhow",
+        "libclap",
         "libcodespan_reporting",
         "libcxxbridge_cmd",
         "libproc_macro2",
         "libquote",
-        "libstructopt",
         "libsyn",
     ],
     compile_multilib: "first",
@@ -23,11 +22,10 @@ rust_library_host {
     srcs: ["src/lib.rs"],
     edition: "2018",
     rustlibs: [
-        "libanyhow",
+        "libclap",
         "libcodespan_reporting",
         "libproc_macro2",
         "libquote",
-        "libstructopt",
         "libsyn",
     ],
     compile_multilib: "first",
@@ -35,26 +33,17 @@ rust_library_host {
 
 // dependent_library ["feature_list"]
 //   ansi_term-0.11.0
-//   anyhow-1.0.32 "default,std"
 //   atty-0.2.14
 //   bitflags-1.2.1 "default"
-//   clap-2.33.1 "ansi_term,atty,color,default,strsim,suggestions,vec_map"
+//   clap-2.33.3 "ansi_term,atty,color,default,strsim,suggestions,vec_map"
 //   codespan-reporting-0.9.5
-//   heck-0.3.1
-//   lazy_static-1.4.0
-//   libc-0.2.74
-//   proc-macro-error-1.0.4 "default,syn,syn-error"
-//   proc-macro-error-attr-1.0.4
-//   proc-macro2-1.0.19 "default,proc-macro,span-locations"
-//   quote-1.0.7 "default,proc-macro"
+//   libc-0.2.80
+//   proc-macro2-1.0.24 "span-locations"
+//   quote-1.0.7
 //   strsim-0.8.0
-//   structopt-0.3.15 "default"
-//   structopt-derive-0.4.8
-//   syn-1.0.36 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote"
-//   termcolor-1.1.0
+//   syn-1.0.50 "clone-impls,full,parsing,printing,quote"
+//   termcolor-1.1.2
 //   textwrap-0.11.0
-//   unicode-segmentation-1.6.0
 //   unicode-width-0.1.8 "default"
 //   unicode-xid-0.2.1 "default"
 //   vec_map-0.8.2
-//   version_check-0.9.2

@@ -15,18 +15,18 @@
 //!
 //! fn main() {
 //!     cxx_build::bridge("src/main.rs")
-//!         .file("../demo-cxx/demo.cc")
+//!         .file("src/demo.cc")
 //!         .flag_if_supported("-std=c++11")
 //!         .compile("cxxbridge-demo");
 //!
 //!     println!("cargo:rerun-if-changed=src/main.rs");
-//!     println!("cargo:rerun-if-changed=../demo-cxx/demo.h");
-//!     println!("cargo:rerun-if-changed=../demo-cxx/demo.cc");
+//!     println!("cargo:rerun-if-changed=src/demo.cc");
+//!     println!("cargo:rerun-if-changed=include/demo.h");
 //! }
 //! ```
 //!
-//! A runnable working setup with this build script is shown in the
-//! *demo-rs* and *demo-cxx* directories of [https://github.com/dtolnay/cxx].
+//! A runnable working setup with this build script is shown in the *demo*
+//! directory of [https://github.com/dtolnay/cxx].
 //!
 //! [https://github.com/dtolnay/cxx]: https://github.com/dtolnay/cxx
 //!
@@ -46,25 +46,42 @@
 //! ```
 
 #![allow(
+    clippy::drop_copy,
     clippy::inherent_to_string,
     clippy::needless_doctest_main,
     clippy::new_without_default,
+    clippy::or_fun_call,
     clippy::toplevel_ref_arg
 )]
 
+mod cfg;
+mod deps;
 mod error;
 mod gen;
+mod intern;
+mod out;
 mod paths;
 mod syntax;
+mod target;
+mod vec;
 
-use crate::error::Result;
+use crate::deps::{Crate, HeaderDir};
+use crate::error::{Error, Result};
+use crate::gen::error::report;
 use crate::gen::Opt;
-use anyhow::anyhow;
-use std::fs;
+use crate::paths::PathExt;
+use crate::target::TargetDir;
+use cc::Build;
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet};
+use std::env;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::iter;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
+
+pub use crate::cfg::{Cfg, CFG};
 
 /// This returns a [`cc::Build`] on which you should continue to set up any
 /// additional source files or compiler flags, and lastly call its [`compile`]
@@ -72,7 +89,7 @@ use std::process;
 ///
 /// [`compile`]: https://docs.rs/cc/1.0.49/cc/struct.Build.html#method.compile
 #[must_use]
-pub fn bridge(rust_source_file: impl AsRef<Path>) -> cc::Build {
+pub fn bridge(rust_source_file: impl AsRef<Path>) -> Build {
     bridges(iter::once(rust_source_file))
 }
 
@@ -82,41 +99,301 @@ pub fn bridge(rust_source_file: impl AsRef<Path>) -> cc::Build {
 /// ```no_run
 /// let source_files = vec!["src/main.rs", "src/path/to/other.rs"];
 /// cxx_build::bridges(source_files)
-///     .file("../demo-cxx/demo.cc")
+///     .file("src/demo.cc")
 ///     .flag_if_supported("-std=c++11")
 ///     .compile("cxxbridge-demo");
 /// ```
-pub fn bridges(rust_source_files: impl IntoIterator<Item = impl AsRef<Path>>) -> cc::Build {
-    let mut build = paths::cc_build();
+#[must_use]
+pub fn bridges(rust_source_files: impl IntoIterator<Item = impl AsRef<Path>>) -> Build {
+    let ref mut rust_source_files = rust_source_files.into_iter();
+    build(rust_source_files).unwrap_or_else(|err| {
+        let _ = writeln!(io::stderr(), "\n\ncxxbridge error: {}\n\n", report(err));
+        process::exit(1);
+    })
+}
+
+struct Project {
+    include_prefix: PathBuf,
+    manifest_dir: PathBuf,
+    // The `links = "..."` value from Cargo.toml.
+    links_attribute: Option<OsString>,
+    // Output directory as received from Cargo.
+    out_dir: PathBuf,
+    // Directory into which to symlink all generated code.
+    //
+    // This is *not* used for an #include path, only as a debugging convenience.
+    // Normally available at target/cxxbridge/ if we are able to know where the
+    // target dir is, otherwise under a common scratch dir.
+    //
+    // The reason this isn't the #include dir is that we do not want builds to
+    // have access to headers from arbitrary other parts of the dependency
+    // graph. Using a global directory for all builds would be both a race
+    // condition depending on what order Cargo randomly executes the build
+    // scripts, as well as semantically undesirable for builds not to have to
+    // declare their real dependencies.
+    shared_dir: PathBuf,
+}
+
+impl Project {
+    fn init() -> Result<Self> {
+        let include_prefix = Path::new(CFG.include_prefix);
+        assert!(include_prefix.is_relative());
+        let include_prefix = include_prefix.components().collect();
+
+        let links_attribute = env::var_os("CARGO_MANIFEST_LINKS");
+
+        let manifest_dir = paths::manifest_dir()?;
+        let out_dir = paths::out_dir()?;
+
+        let shared_dir = match target::find_target_dir(&out_dir) {
+            TargetDir::Path(target_dir) => target_dir.join("cxxbridge"),
+            TargetDir::Unknown => scratch::path("cxxbridge"),
+        };
+
+        Ok(Project {
+            include_prefix,
+            manifest_dir,
+            links_attribute,
+            out_dir,
+            shared_dir,
+        })
+    }
+}
+
+// We lay out the OUT_DIR as follows. Everything is namespaced under a cxxbridge
+// subdirectory to avoid stomping on other things that the caller's build script
+// might be doing inside OUT_DIR.
+//
+//     $OUT_DIR/
+//        cxxbridge/
+//           crate/
+//              $CARGO_PKG_NAME -> $CARGO_MANIFEST_DIR
+//           include/
+//              rust/
+//                 cxx.h
+//              $CARGO_PKG_NAME/
+//                 .../
+//                    lib.rs.h
+//           sources/
+//              $CARGO_PKG_NAME/
+//                 .../
+//                    lib.rs.cc
+//
+// The crate/ and include/ directories are placed on the #include path for the
+// current build as well as for downstream builds that have a direct dependency
+// on the current crate.
+fn build(rust_source_files: &mut dyn Iterator<Item = impl AsRef<Path>>) -> Result<Build> {
+    let ref prj = Project::init()?;
+    validate_cfg(prj)?;
+    let this_crate = make_this_crate(prj)?;
+    this_crate.print_to_cargo();
+
+    let mut build = Build::new();
     build.cpp(true);
     build.cpp_link_stdlib(None); // linked via link-cplusplus crate
 
     for path in rust_source_files {
-        if let Err(err) = try_generate_bridge(&mut build, path.as_ref()) {
-            let _ = writeln!(io::stderr(), "\n\ncxxbridge error: {:?}\n\n", anyhow!(err));
-            process::exit(1);
+        generate_bridge(prj, &mut build, path.as_ref())?;
+    }
+
+    eprintln!("\nCXX include path:");
+    for header_dir in this_crate.header_dirs {
+        build.include(&header_dir.path);
+        if header_dir.exported {
+            eprintln!("  {}", header_dir.path.display());
+        } else {
+            eprintln!("  {} (private)", header_dir.path.display());
         }
     }
 
-    build
+    Ok(build)
 }
 
-fn try_generate_bridge(build: &mut cc::Build, rust_source_file: &Path) -> Result<()> {
-    let header = gen::do_generate_header(rust_source_file, Opt::default());
-    let header_path = paths::out_with_extension(rust_source_file, ".h")?;
-    fs::create_dir_all(header_path.parent().unwrap())?;
-    fs::write(&header_path, header)?;
-    paths::symlink_header(&header_path, rust_source_file);
+fn validate_cfg(prj: &Project) -> Result<()> {
+    for exported_dir in &CFG.exported_header_dirs {
+        if !exported_dir.is_absolute() {
+            return Err(Error::ExportedDirNotAbsolute(exported_dir));
+        }
+    }
 
-    let bridge = gen::do_generate_bridge(rust_source_file, Opt::default());
-    let bridge_path = paths::out_with_extension(rust_source_file, ".cc")?;
-    fs::write(&bridge_path, bridge)?;
-    build.file(&bridge_path);
+    for prefix in &CFG.exported_header_prefixes {
+        if prefix.is_empty() {
+            return Err(Error::ExportedEmptyPrefix);
+        }
+    }
 
-    let ref cxx_h = paths::include_dir()?.join("rust").join("cxx.h");
-    let _ = fs::create_dir_all(cxx_h.parent().unwrap());
-    let _ = fs::remove_file(cxx_h);
-    let _ = fs::write(cxx_h, gen::include::HEADER);
+    if prj.links_attribute.is_none() {
+        if !CFG.exported_header_dirs.is_empty() {
+            return Err(Error::ExportedDirsWithoutLinks);
+        }
+        if !CFG.exported_header_prefixes.is_empty() {
+            return Err(Error::ExportedPrefixesWithoutLinks);
+        }
+        if !CFG.exported_header_links.is_empty() {
+            return Err(Error::ExportedLinksWithoutLinks);
+        }
+    }
 
     Ok(())
+}
+
+fn make_this_crate(prj: &Project) -> Result<Crate> {
+    let crate_dir = make_crate_dir(prj);
+    let include_dir = make_include_dir(prj)?;
+
+    let mut this_crate = Crate {
+        include_prefix: Some(prj.include_prefix.clone()),
+        links: prj.links_attribute.clone(),
+        header_dirs: Vec::new(),
+    };
+
+    // The generated code directory (include_dir) is placed in front of
+    // crate_dir on the include line so that `#include "path/to/file.rs"` from
+    // C++ "magically" works and refers to the API generated from that Rust
+    // source file.
+    this_crate.header_dirs.push(HeaderDir {
+        exported: true,
+        path: include_dir,
+    });
+
+    if let Some(crate_dir) = crate_dir {
+        this_crate.header_dirs.push(HeaderDir {
+            exported: true,
+            path: crate_dir,
+        });
+    }
+
+    for exported_dir in &CFG.exported_header_dirs {
+        this_crate.header_dirs.push(HeaderDir {
+            exported: true,
+            path: PathBuf::from(exported_dir),
+        });
+    }
+
+    let mut header_dirs_index = BTreeMap::new();
+    let mut used_header_links = BTreeSet::new();
+    let mut used_header_prefixes = BTreeSet::new();
+    for krate in deps::direct_dependencies() {
+        let mut is_link_exported = || match &krate.links {
+            None => false,
+            Some(links_attribute) => CFG.exported_header_links.iter().any(|&exported| {
+                let matches = links_attribute == exported;
+                if matches {
+                    used_header_links.insert(exported);
+                }
+                matches
+            }),
+        };
+
+        let mut is_prefix_exported = || match &krate.include_prefix {
+            None => false,
+            Some(include_prefix) => CFG.exported_header_prefixes.iter().any(|&exported| {
+                let matches = include_prefix.starts_with(exported);
+                if matches {
+                    used_header_prefixes.insert(exported);
+                }
+                matches
+            }),
+        };
+
+        let exported = is_link_exported() || is_prefix_exported();
+
+        for dir in krate.header_dirs {
+            // Deduplicate dirs reachable via multiple transitive dependencies.
+            match header_dirs_index.entry(dir.path.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(this_crate.header_dirs.len());
+                    this_crate.header_dirs.push(HeaderDir {
+                        exported,
+                        path: dir.path,
+                    });
+                }
+                Entry::Occupied(entry) => {
+                    let index = *entry.get();
+                    this_crate.header_dirs[index].exported |= exported;
+                }
+            }
+        }
+    }
+
+    if let Some(unused) = CFG
+        .exported_header_links
+        .iter()
+        .find(|&exported| !used_header_links.contains(exported))
+    {
+        return Err(Error::UnusedExportedLinks(unused));
+    }
+
+    if let Some(unused) = CFG
+        .exported_header_prefixes
+        .iter()
+        .find(|&exported| !used_header_prefixes.contains(exported))
+    {
+        return Err(Error::UnusedExportedPrefix(unused));
+    }
+
+    Ok(this_crate)
+}
+
+fn make_crate_dir(prj: &Project) -> Option<PathBuf> {
+    if prj.include_prefix.as_os_str().is_empty() {
+        return Some(prj.manifest_dir.clone());
+    }
+    let crate_dir = prj.out_dir.join("cxxbridge").join("crate");
+    let link = crate_dir.join(&prj.include_prefix);
+    if out::symlink_dir(&prj.manifest_dir, link).is_ok() {
+        Some(crate_dir)
+    } else {
+        None
+    }
+}
+
+fn make_include_dir(prj: &Project) -> Result<PathBuf> {
+    let include_dir = prj.out_dir.join("cxxbridge").join("include");
+    let cxx_h = include_dir.join("rust").join("cxx.h");
+    let ref shared_cxx_h = prj.shared_dir.join("rust").join("cxx.h");
+    if let Some(ref original) = env::var_os("DEP_CXXBRIDGE05_HEADER") {
+        out::symlink_file(original, cxx_h)?;
+        out::symlink_file(original, shared_cxx_h)?;
+    } else {
+        out::write(shared_cxx_h, gen::include::HEADER.as_bytes())?;
+        out::symlink_file(shared_cxx_h, cxx_h)?;
+    }
+    Ok(include_dir)
+}
+
+fn generate_bridge(prj: &Project, build: &mut Build, rust_source_file: &Path) -> Result<()> {
+    let opt = Opt {
+        allow_dot_includes: false,
+        ..Opt::default()
+    };
+    let generated = gen::generate_from_path(rust_source_file, &opt);
+    let ref rel_path = paths::local_relative_path(rust_source_file);
+
+    let cxxbridge = prj.out_dir.join("cxxbridge");
+    let include_dir = cxxbridge.join("include").join(&prj.include_prefix);
+    let sources_dir = cxxbridge.join("sources").join(&prj.include_prefix);
+
+    let ref rel_path_h = rel_path.with_appended_extension(".h");
+    let ref header_path = include_dir.join(rel_path_h);
+    out::write(header_path, &generated.header)?;
+
+    let ref link_path = include_dir.join(rel_path);
+    let _ = out::symlink_file(header_path, link_path);
+
+    let ref rel_path_cc = rel_path.with_appended_extension(".cc");
+    let ref implementation_path = sources_dir.join(rel_path_cc);
+    out::write(implementation_path, &generated.implementation)?;
+    build.file(implementation_path);
+
+    let shared_h = prj.shared_dir.join(&prj.include_prefix).join(rel_path_h);
+    let shared_cc = prj.shared_dir.join(&prj.include_prefix).join(rel_path_cc);
+    let _ = out::symlink_file(header_path, shared_h);
+    let _ = out::symlink_file(implementation_path, shared_cc);
+    Ok(())
+}
+
+fn env_os(key: impl AsRef<OsStr>) -> Result<OsString> {
+    let key = key.as_ref();
+    env::var_os(key).ok_or_else(|| Error::NoEnv(key.to_owned()))
 }

@@ -7,19 +7,26 @@ mod derive;
 mod discriminant;
 mod doc;
 pub mod error;
+pub mod file;
 pub mod ident;
 mod impls;
+mod improper;
 pub mod mangle;
+mod names;
 pub mod namespace;
 mod parse;
+pub mod qualified;
 pub mod report;
 pub mod set;
 pub mod symbol;
 mod tokens;
+mod toposort;
 pub mod types;
 
 use self::discriminant::Discriminant;
+use self::namespace::Namespace;
 use self::parse::kw;
+use self::symbol::Symbol;
 use proc_macro2::{Ident, Span};
 use syn::punctuated::Punctuated;
 use syn::token::{Brace, Bracket, Paren};
@@ -32,7 +39,7 @@ pub use self::parse::parse_items;
 pub use self::types::Types;
 
 pub enum Api {
-    Include(String),
+    Include(Include),
     Struct(Struct),
     Enum(Enum),
     CxxType(ExternType),
@@ -40,19 +47,38 @@ pub enum Api {
     RustType(ExternType),
     RustFunction(ExternFn),
     TypeAlias(TypeAlias),
+    Impl(Impl),
+}
+
+pub struct Include {
+    pub path: String,
+    pub kind: IncludeKind,
+    pub begin_span: Span,
+    pub end_span: Span,
+}
+
+/// Whether to emit `#include "path"` or `#include <path>`.
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub enum IncludeKind {
+    /// `#include "quoted/path/to"`
+    Quoted,
+    /// `#include <bracketed/path/to>`
+    Bracketed,
 }
 
 pub struct ExternType {
     pub doc: Doc,
     pub type_token: Token![type],
-    pub ident: Ident,
+    pub name: Pair,
+    pub semi_token: Token![;],
+    pub trusted: bool,
 }
 
 pub struct Struct {
     pub doc: Doc,
     pub derives: Vec<Derive>,
     pub struct_token: Token![struct],
-    pub ident: Ident,
+    pub name: Pair,
     pub brace_token: Brace,
     pub fields: Vec<Var>,
 }
@@ -60,7 +86,7 @@ pub struct Struct {
 pub struct Enum {
     pub doc: Doc,
     pub enum_token: Token![enum],
-    pub ident: Ident,
+    pub name: Pair,
     pub brace_token: Brace,
     pub variants: Vec<Variant>,
     pub repr: Atom,
@@ -69,20 +95,28 @@ pub struct Enum {
 pub struct ExternFn {
     pub lang: Lang,
     pub doc: Doc,
-    pub ident: Ident,
+    pub name: Pair,
     pub sig: Signature,
     pub semi_token: Token![;],
 }
 
 pub struct TypeAlias {
+    pub doc: Doc,
     pub type_token: Token![type],
-    pub ident: Ident,
+    pub name: Pair,
     pub eq_token: Token![=],
     pub ty: RustType,
     pub semi_token: Token![;],
 }
 
+pub struct Impl {
+    pub impl_token: Token![impl],
+    pub ty: Type,
+    pub brace_token: Brace,
+}
+
 pub struct Signature {
+    pub unsafety: Option<Token![unsafe]>,
     pub fn_token: Token![fn],
     pub receiver: Option<Receiver>,
     pub args: Punctuated<Var, Token![,]>,
@@ -103,7 +137,7 @@ pub struct Receiver {
     pub lifetime: Option<Lifetime>,
     pub mutability: Option<Token![mut]>,
     pub var: Token![self],
-    pub ty: Ident,
+    pub ty: ResolvableName,
     pub shorthand: bool,
 }
 
@@ -114,7 +148,7 @@ pub struct Variant {
 }
 
 pub enum Type {
-    Ident(Ident),
+    Ident(ResolvableName),
     RustBox(Box<Ty1>),
     RustVec(Box<Ty1>),
     UniquePtr(Box<Ty1>),
@@ -150,4 +184,20 @@ pub struct Slice {
 pub enum Lang {
     Cxx,
     Rust,
+}
+
+// An association of a defined Rust name with a fully resolved, namespace
+// qualified C++ name.
+#[derive(Clone)]
+pub struct Pair {
+    pub namespace: Namespace,
+    pub cxx: Ident,
+    pub rust: Ident,
+}
+
+// Wrapper for a type which needs to be resolved before it can be printed in
+// C++.
+#[derive(Clone, PartialEq, Hash)]
+pub struct ResolvableName {
+    pub rust: Ident,
 }

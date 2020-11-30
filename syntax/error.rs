@@ -19,8 +19,10 @@ pub static ERRORS: &[Error] = &[
     CXX_STRING_BY_VALUE,
     CXX_TYPE_BY_VALUE,
     DISCRIMINANT_OVERFLOW,
+    DOT_INCLUDE,
     DOUBLE_UNDERSCORE,
     RUST_TYPE_BY_VALUE,
+    UNSUPPORTED_TYPE,
     USE_NOT_ALLOWED,
 ];
 
@@ -54,6 +56,12 @@ pub static DISCRIMINANT_OVERFLOW: Error = Error {
     note: Some("note: explicitly set `= 0` if that is desired outcome"),
 };
 
+pub static DOT_INCLUDE: Error = Error {
+    msg: "#include relative to `.` or `..` is not supported in Cargo builds",
+    label: Some("#include relative to `.` or `..` is not supported in Cargo builds"),
+    note: Some("note: use a path starting with the crate name"),
+};
+
 pub static DOUBLE_UNDERSCORE: Error = Error {
     msg: "identifiers containing double underscore are reserved in C++",
     label: Some("reserved identifier"),
@@ -64,6 +72,12 @@ pub static RUST_TYPE_BY_VALUE: Error = Error {
     msg: "opaque Rust type by value is not supported",
     label: None,
     note: Some("hint: wrap it in a Box<>"),
+};
+
+pub static UNSUPPORTED_TYPE: Error = Error {
+    msg: "unsupported type: ",
+    label: Some("unsupported type"),
+    note: None,
 };
 
 pub static USE_NOT_ALLOWED: Error = Error {

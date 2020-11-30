@@ -1,3 +1,4 @@
+use crate::syntax::namespace::Namespace;
 use crate::syntax::report::Errors;
 use crate::syntax::Atom::{self, *};
 use crate::syntax::{Derive, Doc};
@@ -10,19 +11,9 @@ pub struct Parser<'a> {
     pub doc: Option<&'a mut Doc>,
     pub derives: Option<&'a mut Vec<Derive>>,
     pub repr: Option<&'a mut Option<Atom>>,
-}
-
-pub(super) fn parse_doc(cx: &mut Errors, attrs: &[Attribute]) -> Doc {
-    let mut doc = Doc::new();
-    parse(
-        cx,
-        attrs,
-        Parser {
-            doc: Some(&mut doc),
-            ..Parser::default()
-        },
-    );
-    doc
+    pub cxx_name: Option<&'a mut Option<Ident>>,
+    pub rust_name: Option<&'a mut Option<Ident>>,
+    pub namespace: Option<&'a mut Namespace>,
 }
 
 pub(super) fn parse(cx: &mut Errors, attrs: &[Attribute], mut parser: Parser) {
@@ -52,6 +43,36 @@ pub(super) fn parse(cx: &mut Errors, attrs: &[Attribute], mut parser: Parser) {
                 Ok(attr) => {
                     if let Some(repr) = &mut parser.repr {
                         **repr = Some(attr);
+                        continue;
+                    }
+                }
+                Err(err) => return cx.push(err),
+            }
+        } else if attr.path.is_ident("cxx_name") {
+            match parse_function_alias_attribute.parse2(attr.tokens.clone()) {
+                Ok(attr) => {
+                    if let Some(cxx_name) = &mut parser.cxx_name {
+                        **cxx_name = Some(attr);
+                        continue;
+                    }
+                }
+                Err(err) => return cx.push(err),
+            }
+        } else if attr.path.is_ident("rust_name") {
+            match parse_function_alias_attribute.parse2(attr.tokens.clone()) {
+                Ok(attr) => {
+                    if let Some(rust_name) = &mut parser.rust_name {
+                        **rust_name = Some(attr);
+                        continue;
+                    }
+                }
+                Err(err) => return cx.push(err),
+            }
+        } else if attr.path.is_ident("namespace") {
+            match parse_namespace_attribute.parse2(attr.tokens.clone()) {
+                Ok(attr) => {
+                    if let Some(namespace) = &mut parser.namespace {
+                        **namespace = attr;
                         continue;
                     }
                 }
@@ -98,4 +119,20 @@ fn parse_repr_attribute(input: ParseStream) -> Result<Atom> {
         begin.token_stream(),
         "unrecognized repr",
     ))
+}
+
+fn parse_function_alias_attribute(input: ParseStream) -> Result<Ident> {
+    input.parse::<Token![=]>()?;
+    if input.peek(LitStr) {
+        let lit: LitStr = input.parse()?;
+        lit.parse()
+    } else {
+        input.parse()
+    }
+}
+
+fn parse_namespace_attribute(input: ParseStream) -> Result<Namespace> {
+    input.parse::<Token![=]>()?;
+    let namespace = input.parse::<Namespace>()?;
+    Ok(namespace)
 }

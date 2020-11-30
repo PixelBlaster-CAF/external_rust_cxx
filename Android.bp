@@ -14,6 +14,7 @@ rust_library {
         "libcxxbridge03",
     ],
     shared_libs: ["libc++"],
+    host_supported: true,
 }
 
 cc_library_static {
@@ -25,9 +26,8 @@ cc_library_static {
 
 cc_library_static {
     host_supported: true,
-    name: "libcxx-demo-cxx",
-    srcs: ["demo-cxx/demo.cc"],
-    local_include_dirs: ["demo-cxx"],
+    name: "libcxx-demo-blobstore",
+    srcs: ["demo/src/blobstore.cc"],
     generated_headers: ["cxx-demo-bridge-header", "cxx-bridge-header"],
     generated_sources: ["cxx-demo-bridge-code"],
 }
