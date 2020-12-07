@@ -11,7 +11,7 @@ rust_library {
         "libcxxbridge_macro",
     ],
     static_libs: [
-        "libcxxbridge03",
+        "libcxxbridge05",
     ],
     shared_libs: ["libc++"],
     host_supported: true,
@@ -19,9 +19,13 @@ rust_library {
 
 cc_library_static {
     host_supported: true,
-    name: "libcxxbridge03",
+    name: "libcxxbridge05",
     cflags: ["-DRUST_CXX_NO_EXCEPTIONS"],
-    srcs: ["src/cxx.cc"]
+    srcs: ["src/cxx.cc"],
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.bluetooth.updatable",
+    ],
 }
 
 cc_library_static {
