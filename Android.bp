@@ -46,7 +46,7 @@ rust_library {
     proc_macros: [
         "libcxxbridge_macro",
     ],
-    static_libs: [
+    whole_static_libs: [
         "libcxxbridge05",
     ],
     shared_libs: ["libc++"],
