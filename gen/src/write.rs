@@ -3,13 +3,16 @@ use crate::gen::nested::NamespaceEntries;
 use crate::gen::out::OutFile;
 use crate::gen::{builtin, include, Opt};
 use crate::syntax::atom::Atom::{self, *};
+use crate::syntax::instantiate::{ImplKey, NamedImplKey};
+use crate::syntax::map::UnorderedMap as Map;
+use crate::syntax::set::UnorderedSet;
 use crate::syntax::symbol::Symbol;
+use crate::syntax::trivial::{self, TrivialReason};
 use crate::syntax::{
-    mangle, Api, Enum, ExternFn, ExternType, Pair, ResolvableName, Signature, Struct, Type, Types,
-    Var,
+    derive, mangle, Api, Enum, ExternFn, ExternType, Pair, Signature, Struct, Trait, Type,
+    TypeAlias, Types, Var,
 };
 use proc_macro2::Ident;
-use std::collections::{HashMap, HashSet};
 
 pub(super) fn gen(apis: &[Api], types: &Types, opt: &Opt, header: bool) -> Vec<u8> {
     let mut out_file = OutFile::new(header, opt, types);
@@ -47,10 +50,10 @@ fn write_forward_declarations(out: &mut OutFile, apis: &[Api]) {
         for api in apis {
             write!(out, "{:1$}", "", indent);
             match api {
-                Api::Struct(strct) => write_struct_decl(out, &strct.name.cxx),
+                Api::Struct(strct) => write_struct_decl(out, &strct.name),
                 Api::Enum(enm) => write_enum_decl(out, enm),
                 Api::CxxType(ety) => write_struct_using(out, &ety.name),
-                Api::RustType(ety) => write_struct_decl(out, &ety.name.cxx),
+                Api::RustType(ety) => write_struct_decl(out, &ety.name),
                 _ => unreachable!(),
             }
         }
@@ -64,7 +67,7 @@ fn write_forward_declarations(out: &mut OutFile, apis: &[Api]) {
 }
 
 fn write_data_structures<'a>(out: &mut OutFile<'a>, apis: &'a [Api]) {
-    let mut methods_for_type = HashMap::new();
+    let mut methods_for_type = Map::new();
     for api in apis {
         if let Api::CxxFunction(efn) | Api::RustFunction(efn) = api {
             if let Some(receiver) = &efn.sig.receiver {
@@ -76,7 +79,7 @@ fn write_data_structures<'a>(out: &mut OutFile<'a>, apis: &'a [Api]) {
         }
     }
 
-    let mut structs_written = HashSet::new();
+    let mut structs_written = UnorderedSet::new();
     let mut toposorted_structs = out.types.toposorted_structs.iter();
     for api in apis {
         match api {
@@ -105,20 +108,28 @@ fn write_data_structures<'a>(out: &mut OutFile<'a>, apis: &'a [Api]) {
                 }
             }
             Api::RustType(ety) => {
-                if let Some(methods) = methods_for_type.get(&ety.name.rust) {
-                    out.next_section();
-                    write_struct_with_methods(out, ety, methods);
-                }
+                out.next_section();
+                let methods = methods_for_type
+                    .get(&ety.name.rust)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                write_opaque_type(out, ety, methods);
             }
             _ => {}
         }
     }
 
+    if out.header {
+        return;
+    }
+
+    out.set_namespace(Default::default());
+
     out.next_section();
     for api in apis {
         if let Api::TypeAlias(ety) = api {
-            if out.types.required_trivial.contains_key(&ety.name.rust) {
-                check_trivial_extern_type(out, &ety.name)
+            if let Some(reasons) = out.types.required_trivial.get(&ety.name.rust) {
+                check_trivial_extern_type(out, ety, reasons)
             }
         }
     }
@@ -128,19 +139,60 @@ fn write_functions<'a>(out: &mut OutFile<'a>, apis: &'a [Api]) {
     if !out.header {
         for api in apis {
             match api {
+                Api::Struct(strct) => write_struct_operator_decls(out, strct),
+                Api::RustType(ety) => write_opaque_type_layout_decls(out, ety),
                 Api::CxxFunction(efn) => write_cxx_function_shim(out, efn),
                 Api::RustFunction(efn) => write_rust_function_decl(out, efn),
                 _ => {}
             }
         }
+
+        write_std_specializations(out, apis);
     }
 
     for api in apis {
-        if let Api::RustFunction(efn) = api {
-            out.next_section();
-            write_rust_function_shim(out, efn);
+        match api {
+            Api::Struct(strct) => write_struct_operators(out, strct),
+            Api::RustType(ety) => write_opaque_type_layout(out, ety),
+            Api::RustFunction(efn) => {
+                out.next_section();
+                write_rust_function_shim(out, efn);
+            }
+            _ => {}
         }
     }
+}
+
+fn write_std_specializations(out: &mut OutFile, apis: &[Api]) {
+    out.set_namespace(Default::default());
+    out.begin_block(Block::Namespace("std"));
+
+    for api in apis {
+        if let Api::Struct(strct) = api {
+            if derive::contains(&strct.derives, Trait::Hash) {
+                out.next_section();
+                out.include.cstddef = true;
+                out.include.functional = true;
+                let qualified = strct.name.to_fully_qualified();
+                writeln!(out, "template <> struct hash<{}> {{", qualified);
+                writeln!(
+                    out,
+                    "  ::std::size_t operator()(const {} &self) const noexcept {{",
+                    qualified,
+                );
+                let link_name = mangle::operator(&strct.name, "hash");
+                write!(out, "    return ::");
+                for name in &strct.name.namespace {
+                    write!(out, "{}::", name);
+                }
+                writeln!(out, "{}(self);", link_name);
+                writeln!(out, "  }}");
+                writeln!(out, "}};");
+            }
+        }
+    }
+
+    out.end_block(Block::Namespace("std"));
 }
 
 fn pick_includes_and_builtins(out: &mut OutFile, apis: &[Api]) {
@@ -159,41 +211,46 @@ fn pick_includes_and_builtins(out: &mut OutFile, apis: &[Api]) {
                 Some(Isize) => out.builtin.rust_isize = true,
                 Some(CxxString) => out.include.string = true,
                 Some(RustString) => out.builtin.rust_string = true,
-                Some(Bool) | Some(F32) | Some(F64) | None => {}
+                Some(Bool) | Some(Char) | Some(F32) | Some(F64) | None => {}
             },
             Type::RustBox(_) => out.builtin.rust_box = true,
             Type::RustVec(_) => out.builtin.rust_vec = true,
             Type::UniquePtr(_) => out.include.memory = true,
+            Type::SharedPtr(_) | Type::WeakPtr(_) => out.include.memory = true,
             Type::Str(_) => out.builtin.rust_str = true,
             Type::CxxVector(_) => out.include.vector = true,
             Type::Fn(_) => out.builtin.rust_fn = true,
-            Type::Slice(_) => out.builtin.rust_slice = true,
-            Type::SliceRefU8(_) => {
-                out.include.cstdint = true;
-                out.builtin.rust_slice = true;
-            }
-            Type::Ref(_) | Type::Void(_) => {}
+            Type::SliceRef(_) => out.builtin.rust_slice = true,
+            Type::Array(_) => out.include.array = true,
+            Type::Ref(_) | Type::Void(_) | Type::Ptr(_) => {}
         }
     }
 }
 
 fn write_struct<'a>(out: &mut OutFile<'a>, strct: &'a Struct, methods: &[&ExternFn]) {
+    let operator_eq = derive::contains(&strct.derives, Trait::PartialEq);
+    let operator_ord = derive::contains(&strct.derives, Trait::PartialOrd);
+
     out.set_namespace(&strct.name.namespace);
-    let guard = format!("CXXBRIDGE05_STRUCT_{}", strct.name.to_symbol());
+    let guard = format!("CXXBRIDGE1_STRUCT_{}", strct.name.to_symbol());
     writeln!(out, "#ifndef {}", guard);
     writeln!(out, "#define {}", guard);
     for line in strct.doc.to_string().lines() {
         writeln!(out, "//{}", line);
     }
     writeln!(out, "struct {} final {{", strct.name.cxx);
+
     for field in &strct.fields {
+        for line in field.doc.to_string().lines() {
+            writeln!(out, "  //{}", line);
+        }
         write!(out, "  ");
         write_type_space(out, &field.ty);
-        writeln!(out, "{};", field.ident);
+        writeln!(out, "{};", field.name.cxx);
     }
-    if !methods.is_empty() {
-        writeln!(out);
-    }
+
+    writeln!(out);
+
     for method in methods {
         write!(out, "  ");
         let sig = &method.sig;
@@ -201,12 +258,52 @@ fn write_struct<'a>(out: &mut OutFile<'a>, strct: &'a Struct, methods: &[&Extern
         write_rust_function_shim_decl(out, &local_name, sig, false);
         writeln!(out, ";");
     }
+
+    if operator_eq {
+        writeln!(
+            out,
+            "  bool operator==(const {} &) const noexcept;",
+            strct.name.cxx,
+        );
+        writeln!(
+            out,
+            "  bool operator!=(const {} &) const noexcept;",
+            strct.name.cxx,
+        );
+    }
+
+    if operator_ord {
+        writeln!(
+            out,
+            "  bool operator<(const {} &) const noexcept;",
+            strct.name.cxx,
+        );
+        writeln!(
+            out,
+            "  bool operator<=(const {} &) const noexcept;",
+            strct.name.cxx,
+        );
+        writeln!(
+            out,
+            "  bool operator>(const {} &) const noexcept;",
+            strct.name.cxx,
+        );
+        writeln!(
+            out,
+            "  bool operator>=(const {} &) const noexcept;",
+            strct.name.cxx,
+        );
+    }
+
+    out.include.type_traits = true;
+    writeln!(out, "  using IsRelocatable = ::std::true_type;");
+
     writeln!(out, "}};");
     writeln!(out, "#endif // {}", guard);
 }
 
-fn write_struct_decl(out: &mut OutFile, ident: &Ident) {
-    writeln!(out, "struct {};", ident);
+fn write_struct_decl(out: &mut OutFile, ident: &Pair) {
+    writeln!(out, "struct {};", ident.cxx);
 }
 
 fn write_enum_decl(out: &mut OutFile, enm: &Enum) {
@@ -219,25 +316,22 @@ fn write_struct_using(out: &mut OutFile, ident: &Pair) {
     writeln!(out, "using {} = {};", ident.cxx, ident.to_fully_qualified());
 }
 
-fn write_struct_with_methods<'a>(
-    out: &mut OutFile<'a>,
-    ety: &'a ExternType,
-    methods: &[&ExternFn],
-) {
+fn write_opaque_type<'a>(out: &mut OutFile<'a>, ety: &'a ExternType, methods: &[&ExternFn]) {
     out.set_namespace(&ety.name.namespace);
-    let guard = format!("CXXBRIDGE05_STRUCT_{}", ety.name.to_symbol());
+    let guard = format!("CXXBRIDGE1_STRUCT_{}", ety.name.to_symbol());
     writeln!(out, "#ifndef {}", guard);
     writeln!(out, "#define {}", guard);
     for line in ety.doc.to_string().lines() {
         writeln!(out, "//{}", line);
     }
-    writeln!(out, "struct {} final {{", ety.name.cxx);
-    writeln!(out, "  {}() = delete;", ety.name.cxx);
+
+    out.builtin.opaque = true;
     writeln!(
         out,
-        "  {}(const {} &) = delete;",
-        ety.name.cxx, ety.name.cxx,
+        "struct {} final : public ::rust::Opaque {{",
+        ety.name.cxx,
     );
+
     for method in methods {
         write!(out, "  ");
         let sig = &method.sig;
@@ -245,13 +339,25 @@ fn write_struct_with_methods<'a>(
         write_rust_function_shim_decl(out, &local_name, sig, false);
         writeln!(out, ";");
     }
+
+    writeln!(out, "  ~{}() = delete;", ety.name.cxx);
+    writeln!(out);
+
+    out.builtin.layout = true;
+    out.include.cstddef = true;
+    writeln!(out, "private:");
+    writeln!(out, "  friend ::rust::layout;");
+    writeln!(out, "  struct layout {{");
+    writeln!(out, "    static ::std::size_t size() noexcept;");
+    writeln!(out, "    static ::std::size_t align() noexcept;");
+    writeln!(out, "  }};");
     writeln!(out, "}};");
     writeln!(out, "#endif // {}", guard);
 }
 
 fn write_enum<'a>(out: &mut OutFile<'a>, enm: &'a Enum) {
     out.set_namespace(&enm.name.namespace);
-    let guard = format!("CXXBRIDGE05_ENUM_{}", enm.name.to_symbol());
+    let guard = format!("CXXBRIDGE1_ENUM_{}", enm.name.to_symbol());
     writeln!(out, "#ifndef {}", guard);
     writeln!(out, "#define {}", guard);
     for line in enm.doc.to_string().lines() {
@@ -261,7 +367,10 @@ fn write_enum<'a>(out: &mut OutFile<'a>, enm: &'a Enum) {
     write_atom(out, enm.repr);
     writeln!(out, " {{");
     for variant in &enm.variants {
-        writeln!(out, "  {} = {},", variant.ident, variant.discriminant);
+        for line in variant.doc.to_string().lines() {
+            writeln!(out, "  //{}", line);
+        }
+        writeln!(out, "  {} = {},", variant.name.cxx, variant.discriminant);
     }
     writeln!(out, "}};");
     writeln!(out, "#endif // {}", guard);
@@ -269,6 +378,12 @@ fn write_enum<'a>(out: &mut OutFile<'a>, enm: &'a Enum) {
 
 fn check_enum<'a>(out: &mut OutFile<'a>, enm: &'a Enum) {
     out.set_namespace(&enm.name.namespace);
+    out.include.type_traits = true;
+    writeln!(
+        out,
+        "static_assert(::std::is_enum<{}>::value, \"expected enum\");",
+        enm.name.cxx,
+    );
     write!(out, "static_assert(sizeof({}) == sizeof(", enm.name.cxx);
     write_atom(out, enm.repr);
     writeln!(out, "), \"incorrect size\");");
@@ -278,12 +393,12 @@ fn check_enum<'a>(out: &mut OutFile<'a>, enm: &'a Enum) {
         writeln!(
             out,
             ">({}::{}) == {}, \"disagrees with the value in #[cxx::bridge]\");",
-            enm.name.cxx, variant.ident, variant.discriminant,
+            enm.name.cxx, variant.name.cxx, variant.discriminant,
         );
     }
 }
 
-fn check_trivial_extern_type(out: &mut OutFile, id: &Pair) {
+fn check_trivial_extern_type(out: &mut OutFile, alias: &TypeAlias, reasons: &[TrivialReason]) {
     // NOTE: The following static assertion is just nice-to-have and not
     // necessary for soundness. That's because triviality is always declared by
     // the user in the form of an unsafe impl of cxx::ExternType:
@@ -317,24 +432,221 @@ fn check_trivial_extern_type(out: &mut OutFile, id: &Pair) {
     //    + struct rust::IsRelocatable<MyType> : std::true_type {};
     //
 
-    let id = id.to_fully_qualified();
+    let id = alias.name.to_fully_qualified();
     out.builtin.relocatable = true;
     writeln!(out, "static_assert(");
     writeln!(out, "    ::rust::IsRelocatable<{}>::value,", id);
     writeln!(
         out,
-        "    \"type {} marked as Trivial in Rust is not trivially move constructible and trivially destructible in C++\");",
-        id,
+        "    \"type {} should be trivially move constructible and trivially destructible in C++ to be used as {} in Rust\");",
+        id.trim_start_matches("::"),
+        trivial::as_what(&alias.name, reasons),
     );
+}
+
+fn write_struct_operator_decls<'a>(out: &mut OutFile<'a>, strct: &'a Struct) {
+    out.set_namespace(&strct.name.namespace);
+    out.begin_block(Block::ExternC);
+
+    if derive::contains(&strct.derives, Trait::PartialEq) {
+        let link_name = mangle::operator(&strct.name, "eq");
+        writeln!(
+            out,
+            "bool {}(const {1} &, const {1} &) noexcept;",
+            link_name, strct.name.cxx,
+        );
+
+        if !derive::contains(&strct.derives, Trait::Eq) {
+            let link_name = mangle::operator(&strct.name, "ne");
+            writeln!(
+                out,
+                "bool {}(const {1} &, const {1} &) noexcept;",
+                link_name, strct.name.cxx,
+            );
+        }
+    }
+
+    if derive::contains(&strct.derives, Trait::PartialOrd) {
+        let link_name = mangle::operator(&strct.name, "lt");
+        writeln!(
+            out,
+            "bool {}(const {1} &, const {1} &) noexcept;",
+            link_name, strct.name.cxx,
+        );
+
+        let link_name = mangle::operator(&strct.name, "le");
+        writeln!(
+            out,
+            "bool {}(const {1} &, const {1} &) noexcept;",
+            link_name, strct.name.cxx,
+        );
+
+        if !derive::contains(&strct.derives, Trait::Ord) {
+            let link_name = mangle::operator(&strct.name, "gt");
+            writeln!(
+                out,
+                "bool {}(const {1} &, const {1} &) noexcept;",
+                link_name, strct.name.cxx,
+            );
+
+            let link_name = mangle::operator(&strct.name, "ge");
+            writeln!(
+                out,
+                "bool {}(const {1} &, const {1} &) noexcept;",
+                link_name, strct.name.cxx,
+            );
+        }
+    }
+
+    if derive::contains(&strct.derives, Trait::Hash) {
+        out.include.cstddef = true;
+        let link_name = mangle::operator(&strct.name, "hash");
+        writeln!(
+            out,
+            "::std::size_t {}(const {} &) noexcept;",
+            link_name, strct.name.cxx,
+        );
+    }
+
+    out.end_block(Block::ExternC);
+}
+
+fn write_struct_operators<'a>(out: &mut OutFile<'a>, strct: &'a Struct) {
+    if out.header {
+        return;
+    }
+
+    out.set_namespace(&strct.name.namespace);
+
+    if derive::contains(&strct.derives, Trait::PartialEq) {
+        out.next_section();
+        writeln!(
+            out,
+            "bool {0}::operator==(const {0} &rhs) const noexcept {{",
+            strct.name.cxx,
+        );
+        let link_name = mangle::operator(&strct.name, "eq");
+        writeln!(out, "  return {}(*this, rhs);", link_name);
+        writeln!(out, "}}");
+
+        out.next_section();
+        writeln!(
+            out,
+            "bool {0}::operator!=(const {0} &rhs) const noexcept {{",
+            strct.name.cxx,
+        );
+        if derive::contains(&strct.derives, Trait::Eq) {
+            writeln!(out, "  return !(*this == rhs);");
+        } else {
+            let link_name = mangle::operator(&strct.name, "ne");
+            writeln!(out, "  return {}(*this, rhs);", link_name);
+        }
+        writeln!(out, "}}");
+    }
+
+    if derive::contains(&strct.derives, Trait::PartialOrd) {
+        out.next_section();
+        writeln!(
+            out,
+            "bool {0}::operator<(const {0} &rhs) const noexcept {{",
+            strct.name.cxx,
+        );
+        let link_name = mangle::operator(&strct.name, "lt");
+        writeln!(out, "  return {}(*this, rhs);", link_name);
+        writeln!(out, "}}");
+
+        out.next_section();
+        writeln!(
+            out,
+            "bool {0}::operator<=(const {0} &rhs) const noexcept {{",
+            strct.name.cxx,
+        );
+        let link_name = mangle::operator(&strct.name, "le");
+        writeln!(out, "  return {}(*this, rhs);", link_name);
+        writeln!(out, "}}");
+
+        out.next_section();
+        writeln!(
+            out,
+            "bool {0}::operator>(const {0} &rhs) const noexcept {{",
+            strct.name.cxx,
+        );
+        if derive::contains(&strct.derives, Trait::Ord) {
+            writeln!(out, "  return !(*this <= rhs);");
+        } else {
+            let link_name = mangle::operator(&strct.name, "gt");
+            writeln!(out, "  return {}(*this, rhs);", link_name);
+        }
+        writeln!(out, "}}");
+
+        out.next_section();
+        writeln!(
+            out,
+            "bool {0}::operator>=(const {0} &rhs) const noexcept {{",
+            strct.name.cxx,
+        );
+        if derive::contains(&strct.derives, Trait::Ord) {
+            writeln!(out, "  return !(*this < rhs);");
+        } else {
+            let link_name = mangle::operator(&strct.name, "ge");
+            writeln!(out, "  return {}(*this, rhs);", link_name);
+        }
+        writeln!(out, "}}");
+    }
+}
+
+fn write_opaque_type_layout_decls<'a>(out: &mut OutFile<'a>, ety: &'a ExternType) {
+    out.set_namespace(&ety.name.namespace);
+    out.begin_block(Block::ExternC);
+
+    let link_name = mangle::operator(&ety.name, "sizeof");
+    writeln!(out, "::std::size_t {}() noexcept;", link_name);
+
+    let link_name = mangle::operator(&ety.name, "alignof");
+    writeln!(out, "::std::size_t {}() noexcept;", link_name);
+
+    out.end_block(Block::ExternC);
+}
+
+fn write_opaque_type_layout<'a>(out: &mut OutFile<'a>, ety: &'a ExternType) {
+    if out.header {
+        return;
+    }
+
+    out.set_namespace(&ety.name.namespace);
+
+    out.next_section();
+    let link_name = mangle::operator(&ety.name, "sizeof");
+    writeln!(
+        out,
+        "::std::size_t {}::layout::size() noexcept {{",
+        ety.name.cxx,
+    );
+    writeln!(out, "  return {}();", link_name);
+    writeln!(out, "}}");
+
+    out.next_section();
+    let link_name = mangle::operator(&ety.name, "alignof");
+    writeln!(
+        out,
+        "::std::size_t {}::layout::align() noexcept {{",
+        ety.name.cxx,
+    );
+    writeln!(out, "  return {}();", link_name);
+    writeln!(out, "}}");
+}
+
+fn begin_function_definition(out: &mut OutFile) {
+    if let Some(annotation) = &out.opt.cxx_impl_annotations {
+        write!(out, "{} ", annotation);
+    }
 }
 
 fn write_cxx_function_shim<'a>(out: &mut OutFile<'a>, efn: &'a ExternFn) {
     out.next_section();
     out.set_namespace(&efn.name.namespace);
     out.begin_block(Block::ExternC);
-    if let Some(annotation) = &out.opt.cxx_impl_annotations {
-        write!(out, "{} ", annotation);
-    }
+    begin_function_definition(out);
     if efn.throws {
         out.builtin.ptr_len = true;
         write!(out, "::rust::repr::PtrLen ");
@@ -344,13 +656,13 @@ fn write_cxx_function_shim<'a>(out: &mut OutFile<'a>, efn: &'a ExternFn) {
     let mangled = mangle::extern_fn(efn, out.types);
     write!(out, "{}(", mangled);
     if let Some(receiver) = &efn.receiver {
-        if receiver.mutability.is_none() {
+        if !receiver.mutable {
             write!(out, "const ");
         }
         write!(
             out,
             "{} &self",
-            out.types.resolve(&receiver.ty).to_fully_qualified(),
+            out.types.resolve(&receiver.ty).name.to_fully_qualified(),
         );
     }
     for (i, arg) in efn.args.iter().enumerate() {
@@ -380,7 +692,7 @@ fn write_cxx_function_shim<'a>(out: &mut OutFile<'a>, efn: &'a ExternFn) {
         Some(receiver) => write!(
             out,
             "({}::*{}$)(",
-            out.types.resolve(&receiver.ty).to_fully_qualified(),
+            out.types.resolve(&receiver.ty).name.to_fully_qualified(),
             efn.name.rust,
         ),
     }
@@ -392,7 +704,7 @@ fn write_cxx_function_shim<'a>(out: &mut OutFile<'a>, efn: &'a ExternFn) {
     }
     write!(out, ")");
     if let Some(receiver) = &efn.receiver {
-        if receiver.mutability.is_none() {
+        if !receiver.mutable {
             write!(out, " const");
         }
     }
@@ -402,7 +714,7 @@ fn write_cxx_function_shim<'a>(out: &mut OutFile<'a>, efn: &'a ExternFn) {
         Some(receiver) => write!(
             out,
             "&{}::{}",
-            out.types.resolve(&receiver.ty).to_fully_qualified(),
+            out.types.resolve(&receiver.ty).name.to_fully_qualified(),
             efn.name.cxx,
         ),
     }
@@ -430,9 +742,11 @@ fn write_cxx_function_shim<'a>(out: &mut OutFile<'a>, efn: &'a ExternFn) {
             out.builtin.rust_str_repr = true;
             write!(out, "::rust::impl<::rust::Str>::repr(");
         }
-        Some(Type::SliceRefU8(_)) if !indirect_return => {
+        Some(ty @ Type::SliceRef(_)) if !indirect_return => {
             out.builtin.rust_slice_repr = true;
-            write!(out, "::rust::impl<::rust::Slice<uint8_t>>::repr(")
+            write!(out, "::rust::impl<");
+            write_type(out, ty);
+            write!(out, ">::repr(");
         }
         _ => {}
     }
@@ -446,46 +760,33 @@ fn write_cxx_function_shim<'a>(out: &mut OutFile<'a>, efn: &'a ExternFn) {
         }
         if let Type::RustBox(_) = &arg.ty {
             write_type(out, &arg.ty);
-            write!(out, "::from_raw({})", arg.ident);
+            write!(out, "::from_raw({})", arg.name.cxx);
         } else if let Type::UniquePtr(_) = &arg.ty {
             write_type(out, &arg.ty);
-            write!(out, "({})", arg.ident);
-        } else if let Type::Str(_) = arg.ty {
-            out.builtin.rust_str_new_unchecked = true;
-            write!(
-                out,
-                "::rust::impl<::rust::Str>::new_unchecked({})",
-                arg.ident,
-            );
+            write!(out, "({})", arg.name.cxx);
         } else if arg.ty == RustString {
             out.builtin.unsafe_bitcopy = true;
             write!(
                 out,
                 "::rust::String(::rust::unsafe_bitcopy, *{})",
-                arg.ident,
+                arg.name.cxx,
             );
         } else if let Type::RustVec(_) = arg.ty {
             out.builtin.unsafe_bitcopy = true;
             write_type(out, &arg.ty);
-            write!(out, "(::rust::unsafe_bitcopy, *{})", arg.ident);
-        } else if let Type::SliceRefU8(_) = arg.ty {
-            write!(
-                out,
-                "::rust::Slice<uint8_t>(static_cast<const uint8_t *>({0}.ptr), {0}.len)",
-                arg.ident,
-            );
+            write!(out, "(::rust::unsafe_bitcopy, *{})", arg.name.cxx);
         } else if out.types.needs_indirect_abi(&arg.ty) {
             out.include.utility = true;
-            write!(out, "::std::move(*{})", arg.ident);
+            write!(out, "::std::move(*{})", arg.name.cxx);
         } else {
-            write!(out, "{}", arg.ident);
+            write!(out, "{}", arg.name.cxx);
         }
     }
     write!(out, ")");
     match &efn.ret {
         Some(Type::RustBox(_)) => write!(out, ".into_raw()"),
         Some(Type::UniquePtr(_)) => write!(out, ".release()"),
-        Some(Type::Str(_)) | Some(Type::SliceRefU8(_)) if !indirect_return => write!(out, ")"),
+        Some(Type::Str(_)) | Some(Type::SliceRef(_)) if !indirect_return => write!(out, ")"),
         _ => {}
     }
     if indirect_return {
@@ -501,7 +802,7 @@ fn write_cxx_function_shim<'a>(out: &mut OutFile<'a>, efn: &'a ExternFn) {
         writeln!(out, "        throw$.len = ::std::strlen(catch$);");
         writeln!(
             out,
-            "        throw$.ptr = ::cxxbridge05$exception(catch$, throw$.len);",
+            "        throw$.ptr = const_cast<char *>(::cxxbridge1$exception(catch$, throw$.len));",
         );
         writeln!(out, "      }});");
         writeln!(out, "  return throw$;");
@@ -509,19 +810,14 @@ fn write_cxx_function_shim<'a>(out: &mut OutFile<'a>, efn: &'a ExternFn) {
     writeln!(out, "}}");
     for arg in &efn.args {
         if let Type::Fn(f) = &arg.ty {
-            let var = &arg.ident;
+            let var = &arg.name;
             write_function_pointer_trampoline(out, efn, var, f);
         }
     }
     out.end_block(Block::ExternC);
 }
 
-fn write_function_pointer_trampoline(
-    out: &mut OutFile,
-    efn: &ExternFn,
-    var: &Ident,
-    f: &Signature,
-) {
+fn write_function_pointer_trampoline(out: &mut OutFile, efn: &ExternFn, var: &Pair, f: &Signature) {
     let r_trampoline = mangle::r_trampoline(efn, var, out.types);
     let indirect_call = true;
     write_rust_function_decl_impl(out, &r_trampoline, f, indirect_call);
@@ -556,13 +852,13 @@ fn write_rust_function_decl_impl(
     write!(out, "{}(", link_name);
     let mut needs_comma = false;
     if let Some(receiver) = &sig.receiver {
-        if receiver.mutability.is_none() {
+        if !receiver.mutable {
             write!(out, "const ");
         }
         write!(
             out,
             "{} &self",
-            out.types.resolve(&receiver.ty).to_fully_qualified(),
+            out.types.resolve(&receiver.ty).name.to_fully_qualified(),
         );
         needs_comma = true;
     }
@@ -577,7 +873,13 @@ fn write_rust_function_decl_impl(
         if needs_comma {
             write!(out, ", ");
         }
-        write_return_type(out, &sig.ret);
+        match sig.ret.as_ref().unwrap() {
+            Type::Ref(ret) => {
+                write_pointee_type(out, &ret.inner, ret.mutable);
+                write!(out, " *");
+            }
+            ret => write_type_space(out, ret),
+        }
         write!(out, "*return$");
         needs_comma = true;
     }
@@ -597,7 +899,11 @@ fn write_rust_function_shim<'a>(out: &mut OutFile<'a>, efn: &'a ExternFn) {
     }
     let local_name = match &efn.sig.receiver {
         None => efn.name.cxx.to_string(),
-        Some(receiver) => format!("{}::{}", out.types.resolve(&receiver.ty).cxx, efn.name.cxx),
+        Some(receiver) => format!(
+            "{}::{}",
+            out.types.resolve(&receiver.ty).name.cxx,
+            efn.name.cxx,
+        ),
     };
     let invoke = mangle::extern_fn(efn, out.types);
     let indirect_call = false;
@@ -610,6 +916,7 @@ fn write_rust_function_shim_decl(
     sig: &Signature,
     indirect_call: bool,
 ) {
+    begin_function_definition(out);
     write_return_type(out, &sig.ret);
     write!(out, "{}(", local_name);
     for (i, arg) in sig.args.iter().enumerate() {
@@ -617,7 +924,7 @@ fn write_rust_function_shim_decl(
             write!(out, ", ");
         }
         write_type_space(out, &arg.ty);
-        write!(out, "{}", arg.ident);
+        write!(out, "{}", arg.name.cxx);
     }
     if indirect_call {
         if !sig.args.is_empty() {
@@ -627,7 +934,7 @@ fn write_rust_function_shim_decl(
     }
     write!(out, ")");
     if let Some(receiver) = &sig.receiver {
-        if receiver.mutability.is_none() {
+        if !receiver.mutable {
             write!(out, " const");
         }
     }
@@ -659,7 +966,7 @@ fn write_rust_function_shim_impl(
             out.builtin.manually_drop = true;
             write!(out, "  ::rust::ManuallyDrop<");
             write_type(out, &arg.ty);
-            writeln!(out, "> {}$(::std::move({0}));", arg.ident);
+            writeln!(out, "> {}$(::std::move({0}));", arg.name.cxx);
         }
     }
     write!(out, "  ");
@@ -667,7 +974,13 @@ fn write_rust_function_shim_impl(
     if indirect_return {
         out.builtin.maybe_uninit = true;
         write!(out, "::rust::MaybeUninit<");
-        write_type(out, sig.ret.as_ref().unwrap());
+        match sig.ret.as_ref().unwrap() {
+            Type::Ref(ret) => {
+                write_pointee_type(out, &ret.inner, ret.mutable);
+                write!(out, " *");
+            }
+            ret => write_type(out, ret),
+        }
         writeln!(out, "> return$;");
         write!(out, "  ");
     } else if let Some(ret) = &sig.ret {
@@ -686,9 +999,11 @@ fn write_rust_function_shim_impl(
                 out.builtin.rust_str_new_unchecked = true;
                 write!(out, "::rust::impl<::rust::Str>::new_unchecked(");
             }
-            Type::SliceRefU8(_) => {
+            Type::SliceRef(_) => {
                 out.builtin.rust_slice_new = true;
-                write!(out, "::rust::impl<::rust::Slice<uint8_t>>::slice(");
+                write!(out, "::rust::impl<");
+                write_type(out, ret);
+                write!(out, ">::slice(");
             }
             _ => {}
         }
@@ -707,23 +1022,13 @@ fn write_rust_function_shim_impl(
         if needs_comma {
             write!(out, ", ");
         }
-        match &arg.ty {
-            Type::Str(_) => {
-                out.builtin.rust_str_repr = true;
-                write!(out, "::rust::impl<::rust::Str>::repr(");
-            }
-            Type::SliceRefU8(_) => {
-                out.builtin.rust_slice_repr = true;
-                write!(out, "::rust::impl<::rust::Slice<uint8_t>>::repr(");
-            }
-            ty if out.types.needs_indirect_abi(ty) => write!(out, "&"),
-            _ => {}
+        if out.types.needs_indirect_abi(&arg.ty) {
+            write!(out, "&");
         }
-        write!(out, "{}", arg.ident);
+        write!(out, "{}", arg.name.cxx);
         match &arg.ty {
             Type::RustBox(_) => write!(out, ".into_raw()"),
             Type::UniquePtr(_) => write!(out, ".release()"),
-            Type::Str(_) | Type::SliceRefU8(_) => write!(out, ")"),
             ty if ty != RustString && out.types.needs_indirect_abi(ty) => write!(out, "$.value"),
             _ => {}
         }
@@ -745,8 +1050,7 @@ fn write_rust_function_shim_impl(
     write!(out, ")");
     if !indirect_return {
         if let Some(ret) = &sig.ret {
-            if let Type::RustBox(_) | Type::UniquePtr(_) | Type::Str(_) | Type::SliceRefU8(_) = ret
-            {
+            if let Type::RustBox(_) | Type::UniquePtr(_) | Type::Str(_) | Type::SliceRef(_) = ret {
                 write!(out, ")");
             }
         }
@@ -759,8 +1063,15 @@ fn write_rust_function_shim_impl(
         writeln!(out, "  }}");
     }
     if indirect_return {
-        out.include.utility = true;
-        writeln!(out, "  return ::std::move(return$.value);");
+        write!(out, "  return ");
+        match sig.ret.as_ref().unwrap() {
+            Type::Ref(_) => write!(out, "*return$.value"),
+            _ => {
+                out.include.utility = true;
+                write!(out, "::std::move(return$.value)");
+            }
+        }
+        writeln!(out, ";");
     }
     writeln!(out, "}}");
 }
@@ -785,7 +1096,7 @@ fn write_indirect_return_type(out: &mut OutFile, ty: &Type) {
             write!(out, "*");
         }
         Type::Ref(ty) => {
-            if ty.mutability.is_none() {
+            if !ty.mutable {
                 write!(out, "const ");
             }
             write_type(out, &ty.inner);
@@ -799,7 +1110,7 @@ fn write_indirect_return_type_space(out: &mut OutFile, ty: &Type) {
     write_indirect_return_type(out, ty);
     match ty {
         Type::RustBox(_) | Type::UniquePtr(_) | Type::Ref(_) => {}
-        Type::Str(_) | Type::SliceRefU8(_) => write!(out, " "),
+        Type::Str(_) | Type::SliceRef(_) => write!(out, " "),
         _ => write_space_after_type(out, ty),
     }
 }
@@ -811,15 +1122,15 @@ fn write_extern_return_type_space(out: &mut OutFile, ty: &Option<Type>) {
             write!(out, "*");
         }
         Some(Type::Ref(ty)) => {
-            if ty.mutability.is_none() {
+            if !ty.mutable {
                 write!(out, "const ");
             }
             write_type(out, &ty.inner);
             write!(out, " *");
         }
-        Some(Type::Str(_)) | Some(Type::SliceRefU8(_)) => {
-            out.builtin.ptr_len = true;
-            write!(out, "::rust::repr::PtrLen ");
+        Some(Type::Str(_)) | Some(Type::SliceRef(_)) => {
+            out.builtin.repr_fat = true;
+            write!(out, "::rust::repr::Fat ");
         }
         Some(ty) if out.types.needs_indirect_abi(ty) => write!(out, "void "),
         _ => write_return_type(out, ty),
@@ -832,23 +1143,23 @@ fn write_extern_arg(out: &mut OutFile, arg: &Var) {
             write_type_space(out, &ty.inner);
             write!(out, "*");
         }
-        Type::Str(_) | Type::SliceRefU8(_) => {
-            out.builtin.ptr_len = true;
-            write!(out, "::rust::repr::PtrLen ");
-        }
         _ => write_type_space(out, &arg.ty),
     }
     if out.types.needs_indirect_abi(&arg.ty) {
         write!(out, "*");
     }
-    write!(out, "{}", arg.ident);
+    write!(out, "{}", arg.name.cxx);
 }
 
 fn write_type(out: &mut OutFile, ty: &Type) {
     match ty {
         Type::Ident(ident) => match Atom::from(&ident.rust) {
             Some(atom) => write_atom(out, atom),
-            None => write!(out, "{}", out.types.resolve(ident).to_fully_qualified()),
+            None => write!(
+                out,
+                "{}",
+                out.types.resolve(ident).name.to_fully_qualified(),
+            ),
         },
         Type::RustBox(ty) => {
             write!(out, "::rust::Box<");
@@ -865,30 +1176,42 @@ fn write_type(out: &mut OutFile, ty: &Type) {
             write_type(out, &ptr.inner);
             write!(out, ">");
         }
+        Type::SharedPtr(ptr) => {
+            write!(out, "::std::shared_ptr<");
+            write_type(out, &ptr.inner);
+            write!(out, ">");
+        }
+        Type::WeakPtr(ptr) => {
+            write!(out, "::std::weak_ptr<");
+            write_type(out, &ptr.inner);
+            write!(out, ">");
+        }
         Type::CxxVector(ty) => {
             write!(out, "::std::vector<");
             write_type(out, &ty.inner);
             write!(out, ">");
         }
         Type::Ref(r) => {
-            if r.mutability.is_none() {
-                write!(out, "const ");
-            }
-            write_type(out, &r.inner);
+            write_pointee_type(out, &r.inner, r.mutable);
             write!(out, " &");
         }
-        Type::Slice(_) => {
-            // For now, only U8 slices are supported, which are covered separately below
-            unreachable!()
+        Type::Ptr(p) => {
+            write_pointee_type(out, &p.inner, p.mutable);
+            write!(out, " *");
         }
         Type::Str(_) => {
             write!(out, "::rust::Str");
         }
-        Type::SliceRefU8(_) => {
-            write!(out, "::rust::Slice<uint8_t>");
+        Type::SliceRef(slice) => {
+            write!(out, "::rust::Slice<");
+            if slice.mutability.is_none() {
+                write!(out, "const ");
+            }
+            write_type(out, &slice.inner);
+            write!(out, ">");
         }
         Type::Fn(f) => {
-            write!(out, "::rust::{}<", if f.throws { "TryFn" } else { "Fn" });
+            write!(out, "::rust::Fn<");
             match &f.ret {
                 Some(ret) => write_type(out, ret),
                 None => write!(out, "void"),
@@ -902,22 +1225,43 @@ fn write_type(out: &mut OutFile, ty: &Type) {
             }
             write!(out, ")>");
         }
+        Type::Array(a) => {
+            write!(out, "::std::array<");
+            write_type(out, &a.inner);
+            write!(out, ", {}>", &a.len);
+        }
         Type::Void(_) => unreachable!(),
+    }
+}
+
+// Write just the T type behind a &T or &mut T or *const T or *mut T.
+fn write_pointee_type(out: &mut OutFile, inner: &Type, mutable: bool) {
+    if let Type::Ptr(_) = inner {
+        write_type_space(out, inner);
+        if !mutable {
+            write!(out, "const");
+        }
+    } else {
+        if !mutable {
+            write!(out, "const ");
+        }
+        write_type(out, inner);
     }
 }
 
 fn write_atom(out: &mut OutFile, atom: Atom) {
     match atom {
         Bool => write!(out, "bool"),
-        U8 => write!(out, "uint8_t"),
-        U16 => write!(out, "uint16_t"),
-        U32 => write!(out, "uint32_t"),
-        U64 => write!(out, "uint64_t"),
-        Usize => write!(out, "size_t"),
-        I8 => write!(out, "int8_t"),
-        I16 => write!(out, "int16_t"),
-        I32 => write!(out, "int32_t"),
-        I64 => write!(out, "int64_t"),
+        Char => write!(out, "char"),
+        U8 => write!(out, "::std::uint8_t"),
+        U16 => write!(out, "::std::uint16_t"),
+        U32 => write!(out, "::std::uint32_t"),
+        U64 => write!(out, "::std::uint64_t"),
+        Usize => write!(out, "::std::size_t"),
+        I8 => write!(out, "::std::int8_t"),
+        I16 => write!(out, "::std::int16_t"),
+        I32 => write!(out, "::std::int32_t"),
+        I64 => write!(out, "::std::int64_t"),
         Isize => write!(out, "::rust::isize"),
         F32 => write!(out, "float"),
         F64 => write!(out, "double"),
@@ -936,33 +1280,62 @@ fn write_space_after_type(out: &mut OutFile, ty: &Type) {
         Type::Ident(_)
         | Type::RustBox(_)
         | Type::UniquePtr(_)
+        | Type::SharedPtr(_)
+        | Type::WeakPtr(_)
         | Type::Str(_)
         | Type::CxxVector(_)
         | Type::RustVec(_)
-        | Type::SliceRefU8(_)
-        | Type::Fn(_) => write!(out, " "),
-        Type::Ref(_) => {}
-        Type::Void(_) | Type::Slice(_) => unreachable!(),
+        | Type::SliceRef(_)
+        | Type::Fn(_)
+        | Type::Array(_) => write!(out, " "),
+        Type::Ref(_) | Type::Ptr(_) => {}
+        Type::Void(_) => unreachable!(),
     }
 }
 
-// Only called for legal referent types of unique_ptr and element types of
-// std::vector and Vec.
-fn to_typename(ty: &Type, types: &Types) -> String {
-    match ty {
-        Type::Ident(ident) => types.resolve(&ident).to_fully_qualified(),
-        Type::CxxVector(ptr) => format!("::std::vector<{}>", to_typename(&ptr.inner, types)),
-        _ => unreachable!(),
+#[derive(Copy, Clone)]
+enum UniquePtr<'a> {
+    Ident(&'a Ident),
+    CxxVector(&'a Ident),
+}
+
+trait ToTypename {
+    fn to_typename(&self, types: &Types) -> String;
+}
+
+impl ToTypename for Ident {
+    fn to_typename(&self, types: &Types) -> String {
+        types.resolve(self).name.to_fully_qualified()
     }
 }
 
-// Only called for legal referent types of unique_ptr and element types of
-// std::vector and Vec.
-fn to_mangled(ty: &Type, types: &Types) -> Symbol {
-    match ty {
-        Type::Ident(ident) => ident.to_symbol(types),
-        Type::CxxVector(ptr) => to_mangled(&ptr.inner, types).prefix_with("std$vector$"),
-        _ => unreachable!(),
+impl<'a> ToTypename for UniquePtr<'a> {
+    fn to_typename(&self, types: &Types) -> String {
+        match self {
+            UniquePtr::Ident(ident) => ident.to_typename(types),
+            UniquePtr::CxxVector(element) => {
+                format!("::std::vector<{}>", element.to_typename(types))
+            }
+        }
+    }
+}
+
+trait ToMangled {
+    fn to_mangled(&self, types: &Types) -> Symbol;
+}
+
+impl ToMangled for Ident {
+    fn to_mangled(&self, types: &Types) -> Symbol {
+        types.resolve(self).name.to_symbol()
+    }
+}
+
+impl<'a> ToMangled for UniquePtr<'a> {
+    fn to_mangled(&self, types: &Types) -> Symbol {
+        match self {
+            UniquePtr::Ident(ident) => ident.to_mangled(types),
+            UniquePtr::CxxVector(element) => element.to_mangled(types).prefix_with("std$vector$"),
+        }
     }
 }
 
@@ -974,233 +1347,252 @@ fn write_generic_instantiations(out: &mut OutFile) {
     out.next_section();
     out.set_namespace(Default::default());
     out.begin_block(Block::ExternC);
-    for ty in out.types {
-        if let Type::RustBox(ty) = ty {
-            if let Type::Ident(inner) = &ty.inner {
-                out.next_section();
-                write_rust_box_extern(out, &out.types.resolve(&inner));
-            }
-        } else if let Type::RustVec(ty) = ty {
-            if let Type::Ident(inner) = &ty.inner {
-                if Atom::from(&inner.rust).is_none() {
-                    out.next_section();
-                    write_rust_vec_extern(out, inner);
-                }
-            }
-        } else if let Type::UniquePtr(ptr) = ty {
-            if let Type::Ident(inner) = &ptr.inner {
-                if Atom::from(&inner.rust).is_none()
-                    && (!out.types.aliases.contains_key(&inner.rust)
-                        || out.types.explicit_impls.contains(ty))
-                {
-                    out.next_section();
-                    write_unique_ptr(out, inner);
-                }
-            }
-        } else if let Type::CxxVector(ptr) = ty {
-            if let Type::Ident(inner) = &ptr.inner {
-                if Atom::from(&inner.rust).is_none()
-                    && (!out.types.aliases.contains_key(&inner.rust)
-                        || out.types.explicit_impls.contains(ty))
-                {
-                    out.next_section();
-                    write_cxx_vector(out, ty, inner);
-                }
-            }
+    for impl_key in out.types.impls.keys() {
+        out.next_section();
+        match *impl_key {
+            ImplKey::RustBox(ident) => write_rust_box_extern(out, ident),
+            ImplKey::RustVec(ident) => write_rust_vec_extern(out, ident),
+            ImplKey::UniquePtr(ident) => write_unique_ptr(out, ident),
+            ImplKey::SharedPtr(ident) => write_shared_ptr(out, ident),
+            ImplKey::WeakPtr(ident) => write_weak_ptr(out, ident),
+            ImplKey::CxxVector(ident) => write_cxx_vector(out, ident),
         }
     }
     out.end_block(Block::ExternC);
 
     out.begin_block(Block::Namespace("rust"));
-    out.begin_block(Block::InlineNamespace("cxxbridge05"));
-    for ty in out.types {
-        if let Type::RustBox(ty) = ty {
-            if let Type::Ident(inner) = &ty.inner {
-                write_rust_box_impl(out, &out.types.resolve(&inner));
-            }
-        } else if let Type::RustVec(ty) = ty {
-            if let Type::Ident(inner) = &ty.inner {
-                if Atom::from(&inner.rust).is_none() {
-                    write_rust_vec_impl(out, inner);
-                }
-            }
+    out.begin_block(Block::InlineNamespace("cxxbridge1"));
+    for impl_key in out.types.impls.keys() {
+        match *impl_key {
+            ImplKey::RustBox(ident) => write_rust_box_impl(out, ident),
+            ImplKey::RustVec(ident) => write_rust_vec_impl(out, ident),
+            _ => {}
         }
     }
-    out.end_block(Block::InlineNamespace("cxxbridge05"));
+    out.end_block(Block::InlineNamespace("cxxbridge1"));
     out.end_block(Block::Namespace("rust"));
 }
 
-fn write_rust_box_extern(out: &mut OutFile, ident: &Pair) {
-    let inner = ident.to_fully_qualified();
-    let instance = ident.to_symbol();
+fn write_rust_box_extern(out: &mut OutFile, key: NamedImplKey) {
+    let resolve = out.types.resolve(&key);
+    let inner = resolve.name.to_fully_qualified();
+    let instance = resolve.name.to_symbol();
 
-    writeln!(out, "#ifndef CXXBRIDGE05_RUST_BOX_{}", instance);
-    writeln!(out, "#define CXXBRIDGE05_RUST_BOX_{}", instance);
     writeln!(
         out,
-        "void cxxbridge05$box${}$uninit(::rust::Box<{}> *ptr) noexcept;",
-        instance, inner,
-    );
-    writeln!(
-        out,
-        "void cxxbridge05$box${}$drop(::rust::Box<{}> *ptr) noexcept;",
-        instance, inner,
-    );
-    writeln!(out, "#endif // CXXBRIDGE05_RUST_BOX_{}", instance);
-}
-
-fn write_rust_vec_extern(out: &mut OutFile, element: &ResolvableName) {
-    let element = Type::Ident(element.clone());
-    let inner = to_typename(&element, out.types);
-    let instance = to_mangled(&element, out.types);
-
-    writeln!(out, "#ifndef CXXBRIDGE05_RUST_VEC_{}", instance);
-    writeln!(out, "#define CXXBRIDGE05_RUST_VEC_{}", instance);
-    writeln!(
-        out,
-        "void cxxbridge05$rust_vec${}$new(const ::rust::Vec<{}> *ptr) noexcept;",
-        instance, inner,
-    );
-    writeln!(
-        out,
-        "void cxxbridge05$rust_vec${}$drop(::rust::Vec<{}> *ptr) noexcept;",
-        instance, inner,
-    );
-    writeln!(
-        out,
-        "size_t cxxbridge05$rust_vec${}$len(const ::rust::Vec<{}> *ptr) noexcept;",
-        instance, inner,
-    );
-    writeln!(
-        out,
-        "const {} *cxxbridge05$rust_vec${}$data(const ::rust::Vec<{0}> *ptr) noexcept;",
+        "{} *cxxbridge1$box${}$alloc() noexcept;",
         inner, instance,
     );
     writeln!(
         out,
-        "void cxxbridge05$rust_vec${}$reserve_total(::rust::Vec<{}> *ptr, size_t cap) noexcept;",
+        "void cxxbridge1$box${}$dealloc({} *) noexcept;",
         instance, inner,
     );
     writeln!(
         out,
-        "void cxxbridge05$rust_vec${}$set_len(::rust::Vec<{}> *ptr, size_t len) noexcept;",
+        "void cxxbridge1$box${}$drop(::rust::Box<{}> *ptr) noexcept;",
         instance, inner,
     );
-    writeln!(
-        out,
-        "size_t cxxbridge05$rust_vec${}$stride() noexcept;",
-        instance,
-    );
-    writeln!(out, "#endif // CXXBRIDGE05_RUST_VEC_{}", instance);
 }
 
-fn write_rust_box_impl(out: &mut OutFile, ident: &Pair) {
-    let inner = ident.to_fully_qualified();
-    let instance = ident.to_symbol();
+fn write_rust_vec_extern(out: &mut OutFile, key: NamedImplKey) {
+    let element = key.rust;
+    let inner = element.to_typename(out.types);
+    let instance = element.to_mangled(out.types);
+
+    out.include.cstddef = true;
+
+    writeln!(
+        out,
+        "void cxxbridge1$rust_vec${}$new(const ::rust::Vec<{}> *ptr) noexcept;",
+        instance, inner,
+    );
+    writeln!(
+        out,
+        "void cxxbridge1$rust_vec${}$drop(::rust::Vec<{}> *ptr) noexcept;",
+        instance, inner,
+    );
+    writeln!(
+        out,
+        "::std::size_t cxxbridge1$rust_vec${}$len(const ::rust::Vec<{}> *ptr) noexcept;",
+        instance, inner,
+    );
+    writeln!(
+        out,
+        "::std::size_t cxxbridge1$rust_vec${}$capacity(const ::rust::Vec<{}> *ptr) noexcept;",
+        instance, inner,
+    );
+    writeln!(
+        out,
+        "const {} *cxxbridge1$rust_vec${}$data(const ::rust::Vec<{0}> *ptr) noexcept;",
+        inner, instance,
+    );
+    writeln!(
+        out,
+        "void cxxbridge1$rust_vec${}$reserve_total(::rust::Vec<{}> *ptr, ::std::size_t cap) noexcept;",
+        instance, inner,
+    );
+    writeln!(
+        out,
+        "void cxxbridge1$rust_vec${}$set_len(::rust::Vec<{}> *ptr, ::std::size_t len) noexcept;",
+        instance, inner,
+    );
+}
+
+fn write_rust_box_impl(out: &mut OutFile, key: NamedImplKey) {
+    let resolve = out.types.resolve(&key);
+    let inner = resolve.name.to_fully_qualified();
+    let instance = resolve.name.to_symbol();
 
     writeln!(out, "template <>");
-    writeln!(out, "void Box<{}>::uninit() noexcept {{", inner);
-    writeln!(out, "  cxxbridge05$box${}$uninit(this);", instance);
+    begin_function_definition(out);
+    writeln!(
+        out,
+        "{} *Box<{}>::allocation::alloc() noexcept {{",
+        inner, inner,
+    );
+    writeln!(out, "  return cxxbridge1$box${}$alloc();", instance);
     writeln!(out, "}}");
 
     writeln!(out, "template <>");
+    begin_function_definition(out);
+    writeln!(
+        out,
+        "void Box<{}>::allocation::dealloc({} *ptr) noexcept {{",
+        inner, inner,
+    );
+    writeln!(out, "  cxxbridge1$box${}$dealloc(ptr);", instance);
+    writeln!(out, "}}");
+
+    writeln!(out, "template <>");
+    begin_function_definition(out);
     writeln!(out, "void Box<{}>::drop() noexcept {{", inner);
-    writeln!(out, "  cxxbridge05$box${}$drop(this);", instance);
+    writeln!(out, "  cxxbridge1$box${}$drop(this);", instance);
     writeln!(out, "}}");
 }
 
-fn write_rust_vec_impl(out: &mut OutFile, element: &ResolvableName) {
-    let element = Type::Ident(element.clone());
-    let inner = to_typename(&element, out.types);
-    let instance = to_mangled(&element, out.types);
+fn write_rust_vec_impl(out: &mut OutFile, key: NamedImplKey) {
+    let element = key.rust;
+    let inner = element.to_typename(out.types);
+    let instance = element.to_mangled(out.types);
+
+    out.include.cstddef = true;
 
     writeln!(out, "template <>");
+    begin_function_definition(out);
     writeln!(out, "Vec<{}>::Vec() noexcept {{", inner);
-    writeln!(out, "  cxxbridge05$rust_vec${}$new(this);", instance);
+    writeln!(out, "  cxxbridge1$rust_vec${}$new(this);", instance);
     writeln!(out, "}}");
 
     writeln!(out, "template <>");
+    begin_function_definition(out);
     writeln!(out, "void Vec<{}>::drop() noexcept {{", inner);
+    writeln!(out, "  return cxxbridge1$rust_vec${}$drop(this);", instance);
+    writeln!(out, "}}");
+
+    writeln!(out, "template <>");
+    begin_function_definition(out);
     writeln!(
         out,
-        "  return cxxbridge05$rust_vec${}$drop(this);",
-        instance,
+        "::std::size_t Vec<{}>::size() const noexcept {{",
+        inner,
     );
+    writeln!(out, "  return cxxbridge1$rust_vec${}$len(this);", instance);
     writeln!(out, "}}");
 
     writeln!(out, "template <>");
-    writeln!(out, "size_t Vec<{}>::size() const noexcept {{", inner);
-    writeln!(out, "  return cxxbridge05$rust_vec${}$len(this);", instance);
-    writeln!(out, "}}");
-
-    writeln!(out, "template <>");
-    writeln!(out, "const {} *Vec<{0}>::data() const noexcept {{", inner);
+    begin_function_definition(out);
     writeln!(
         out,
-        "  return cxxbridge05$rust_vec${}$data(this);",
-        instance,
-    );
-    writeln!(out, "}}");
-
-    writeln!(out, "template <>");
-    writeln!(
-        out,
-        "void Vec<{}>::reserve_total(size_t cap) noexcept {{",
+        "::std::size_t Vec<{}>::capacity() const noexcept {{",
         inner,
     );
     writeln!(
         out,
-        "  return cxxbridge05$rust_vec${}$reserve_total(this, cap);",
+        "  return cxxbridge1$rust_vec${}$capacity(this);",
         instance,
     );
     writeln!(out, "}}");
 
     writeln!(out, "template <>");
-    writeln!(out, "void Vec<{}>::set_len(size_t len) noexcept {{", inner);
+    begin_function_definition(out);
+    writeln!(out, "const {} *Vec<{0}>::data() const noexcept {{", inner);
+    writeln!(out, "  return cxxbridge1$rust_vec${}$data(this);", instance);
+    writeln!(out, "}}");
+
+    writeln!(out, "template <>");
+    begin_function_definition(out);
     writeln!(
         out,
-        "  return cxxbridge05$rust_vec${}$set_len(this, len);",
+        "void Vec<{}>::reserve_total(::std::size_t cap) noexcept {{",
+        inner,
+    );
+    writeln!(
+        out,
+        "  return cxxbridge1$rust_vec${}$reserve_total(this, cap);",
         instance,
     );
     writeln!(out, "}}");
 
     writeln!(out, "template <>");
-    writeln!(out, "size_t Vec<{}>::stride() noexcept {{", inner);
-    writeln!(out, "  return cxxbridge05$rust_vec${}$stride();", instance);
+    begin_function_definition(out);
+    writeln!(
+        out,
+        "void Vec<{}>::set_len(::std::size_t len) noexcept {{",
+        inner,
+    );
+    writeln!(
+        out,
+        "  return cxxbridge1$rust_vec${}$set_len(this, len);",
+        instance,
+    );
     writeln!(out, "}}");
 }
 
-fn write_unique_ptr(out: &mut OutFile, ident: &ResolvableName) {
-    let ty = Type::Ident(ident.clone());
-    let instance = to_mangled(&ty, out.types);
-
-    writeln!(out, "#ifndef CXXBRIDGE05_UNIQUE_PTR_{}", instance);
-    writeln!(out, "#define CXXBRIDGE05_UNIQUE_PTR_{}", instance);
-
-    write_unique_ptr_common(out, &ty);
-
-    writeln!(out, "#endif // CXXBRIDGE05_UNIQUE_PTR_{}", instance);
+fn write_unique_ptr(out: &mut OutFile, key: NamedImplKey) {
+    let ty = UniquePtr::Ident(key.rust);
+    write_unique_ptr_common(out, ty);
 }
 
 // Shared by UniquePtr<T> and UniquePtr<CxxVector<T>>.
-fn write_unique_ptr_common(out: &mut OutFile, ty: &Type) {
+fn write_unique_ptr_common(out: &mut OutFile, ty: UniquePtr) {
     out.include.new = true;
     out.include.utility = true;
-    let inner = to_typename(ty, out.types);
-    let instance = to_mangled(ty, out.types);
+    let inner = ty.to_typename(out.types);
+    let instance = ty.to_mangled(out.types);
 
     let can_construct_from_value = match ty {
         // Some aliases are to opaque types; some are to trivial types. We can't
         // know at code generation time, so we generate both C++ and Rust side
         // bindings for a "new" method anyway. But the Rust code can't be called
         // for Opaque types because the 'new' method is not implemented.
-        Type::Ident(ident) => {
-            out.types.structs.contains_key(&ident.rust)
-                || out.types.aliases.contains_key(&ident.rust)
+        UniquePtr::Ident(ident) => {
+            out.types.structs.contains_key(ident)
+                || out.types.enums.contains_key(ident)
+                || out.types.aliases.contains_key(ident)
         }
-        _ => false,
+        UniquePtr::CxxVector(_) => false,
     };
 
+    let conditional_delete = match ty {
+        UniquePtr::Ident(ident) => {
+            !out.types.structs.contains_key(ident) && !out.types.enums.contains_key(ident)
+        }
+        UniquePtr::CxxVector(_) => false,
+    };
+
+    if conditional_delete {
+        out.builtin.is_complete = true;
+        let definition = match ty {
+            UniquePtr::Ident(ty) => &out.types.resolve(ty).name.cxx,
+            UniquePtr::CxxVector(_) => unreachable!(),
+        };
+        writeln!(
+            out,
+            "static_assert(::rust::detail::is_complete<{}>::value, \"definition of {} is required\");",
+            inner, definition,
+        );
+    }
     writeln!(
         out,
         "static_assert(sizeof(::std::unique_ptr<{}>) == sizeof(void *), \"\");",
@@ -1213,77 +1605,220 @@ fn write_unique_ptr_common(out: &mut OutFile, ty: &Type) {
     );
     writeln!(
         out,
-        "void cxxbridge05$unique_ptr${}$null(::std::unique_ptr<{}> *ptr) noexcept {{",
+        "void cxxbridge1$unique_ptr${}$null(::std::unique_ptr<{}> *ptr) noexcept {{",
         instance, inner,
     );
-    writeln!(out, "  new (ptr) ::std::unique_ptr<{}>();", inner);
+    writeln!(out, "  ::new (ptr) ::std::unique_ptr<{}>();", inner);
     writeln!(out, "}}");
     if can_construct_from_value {
+        out.builtin.maybe_uninit = true;
         writeln!(
             out,
-            "void cxxbridge05$unique_ptr${}$new(::std::unique_ptr<{}> *ptr, {} *value) noexcept {{",
-            instance, inner, inner,
+            "{} *cxxbridge1$unique_ptr${}$uninit(::std::unique_ptr<{}> *ptr) noexcept {{",
+            inner, instance, inner,
         );
         writeln!(
             out,
-            "  new (ptr) ::std::unique_ptr<{}>(new {}(::std::move(*value)));",
-            inner, inner,
+            "  {} *uninit = reinterpret_cast<{} *>(new ::rust::MaybeUninit<{}>);",
+            inner, inner, inner,
         );
+        writeln!(out, "  ::new (ptr) ::std::unique_ptr<{}>(uninit);", inner);
+        writeln!(out, "  return uninit;");
         writeln!(out, "}}");
     }
     writeln!(
         out,
-        "void cxxbridge05$unique_ptr${}$raw(::std::unique_ptr<{}> *ptr, {} *raw) noexcept {{",
+        "void cxxbridge1$unique_ptr${}$raw(::std::unique_ptr<{}> *ptr, {} *raw) noexcept {{",
         instance, inner, inner,
     );
-    writeln!(out, "  new (ptr) ::std::unique_ptr<{}>(raw);", inner);
+    writeln!(out, "  ::new (ptr) ::std::unique_ptr<{}>(raw);", inner);
     writeln!(out, "}}");
     writeln!(
         out,
-        "const {} *cxxbridge05$unique_ptr${}$get(const ::std::unique_ptr<{}>& ptr) noexcept {{",
+        "const {} *cxxbridge1$unique_ptr${}$get(const ::std::unique_ptr<{}>& ptr) noexcept {{",
         inner, instance, inner,
     );
     writeln!(out, "  return ptr.get();");
     writeln!(out, "}}");
     writeln!(
         out,
-        "{} *cxxbridge05$unique_ptr${}$release(::std::unique_ptr<{}>& ptr) noexcept {{",
+        "{} *cxxbridge1$unique_ptr${}$release(::std::unique_ptr<{}>& ptr) noexcept {{",
         inner, instance, inner,
     );
     writeln!(out, "  return ptr.release();");
     writeln!(out, "}}");
     writeln!(
         out,
-        "void cxxbridge05$unique_ptr${}$drop(::std::unique_ptr<{}> *ptr) noexcept {{",
+        "void cxxbridge1$unique_ptr${}$drop(::std::unique_ptr<{}> *ptr) noexcept {{",
         instance, inner,
     );
-    writeln!(out, "  ptr->~unique_ptr();");
+    if conditional_delete {
+        out.builtin.deleter_if = true;
+        writeln!(
+            out,
+            "  ::rust::deleter_if<::rust::detail::is_complete<{}>::value>{{}}(ptr);",
+            inner,
+        );
+    } else {
+        writeln!(out, "  ptr->~unique_ptr();");
+    }
     writeln!(out, "}}");
 }
 
-fn write_cxx_vector(out: &mut OutFile, vector_ty: &Type, element: &ResolvableName) {
-    let element = Type::Ident(element.clone());
-    let inner = to_typename(&element, out.types);
-    let instance = to_mangled(&element, out.types);
+fn write_shared_ptr(out: &mut OutFile, key: NamedImplKey) {
+    let ident = key.rust;
+    let resolve = out.types.resolve(ident);
+    let inner = resolve.name.to_fully_qualified();
+    let instance = resolve.name.to_symbol();
 
-    writeln!(out, "#ifndef CXXBRIDGE05_VECTOR_{}", instance);
-    writeln!(out, "#define CXXBRIDGE05_VECTOR_{}", instance);
+    out.include.new = true;
+    out.include.utility = true;
+
+    // Some aliases are to opaque types; some are to trivial types. We can't
+    // know at code generation time, so we generate both C++ and Rust side
+    // bindings for a "new" method anyway. But the Rust code can't be called for
+    // Opaque types because the 'new' method is not implemented.
+    let can_construct_from_value = out.types.structs.contains_key(ident)
+        || out.types.enums.contains_key(ident)
+        || out.types.aliases.contains_key(ident);
+
     writeln!(
         out,
-        "size_t cxxbridge05$std$vector${}$size(const ::std::vector<{}> &s) noexcept {{",
+        "static_assert(sizeof(::std::shared_ptr<{}>) == 2 * sizeof(void *), \"\");",
+        inner,
+    );
+    writeln!(
+        out,
+        "static_assert(alignof(::std::shared_ptr<{}>) == alignof(void *), \"\");",
+        inner,
+    );
+    writeln!(
+        out,
+        "void cxxbridge1$shared_ptr${}$null(::std::shared_ptr<{}> *ptr) noexcept {{",
+        instance, inner,
+    );
+    writeln!(out, "  ::new (ptr) ::std::shared_ptr<{}>();", inner);
+    writeln!(out, "}}");
+    if can_construct_from_value {
+        out.builtin.maybe_uninit = true;
+        writeln!(
+            out,
+            "{} *cxxbridge1$shared_ptr${}$uninit(::std::shared_ptr<{}> *ptr) noexcept {{",
+            inner, instance, inner,
+        );
+        writeln!(
+            out,
+            "  {} *uninit = reinterpret_cast<{} *>(new ::rust::MaybeUninit<{}>);",
+            inner, inner, inner,
+        );
+        writeln!(out, "  ::new (ptr) ::std::shared_ptr<{}>(uninit);", inner);
+        writeln!(out, "  return uninit;");
+        writeln!(out, "}}");
+    }
+    writeln!(
+        out,
+        "void cxxbridge1$shared_ptr${}$clone(const ::std::shared_ptr<{}>& self, ::std::shared_ptr<{}> *ptr) noexcept {{",
+        instance, inner, inner,
+    );
+    writeln!(out, "  ::new (ptr) ::std::shared_ptr<{}>(self);", inner);
+    writeln!(out, "}}");
+    writeln!(
+        out,
+        "const {} *cxxbridge1$shared_ptr${}$get(const ::std::shared_ptr<{}>& self) noexcept {{",
+        inner, instance, inner,
+    );
+    writeln!(out, "  return self.get();");
+    writeln!(out, "}}");
+    writeln!(
+        out,
+        "void cxxbridge1$shared_ptr${}$drop(::std::shared_ptr<{}> *self) noexcept {{",
+        instance, inner,
+    );
+    writeln!(out, "  self->~shared_ptr();");
+    writeln!(out, "}}");
+}
+
+fn write_weak_ptr(out: &mut OutFile, key: NamedImplKey) {
+    let resolve = out.types.resolve(&key);
+    let inner = resolve.name.to_fully_qualified();
+    let instance = resolve.name.to_symbol();
+
+    out.include.new = true;
+    out.include.utility = true;
+
+    writeln!(
+        out,
+        "static_assert(sizeof(::std::weak_ptr<{}>) == 2 * sizeof(void *), \"\");",
+        inner,
+    );
+    writeln!(
+        out,
+        "static_assert(alignof(::std::weak_ptr<{}>) == alignof(void *), \"\");",
+        inner,
+    );
+    writeln!(
+        out,
+        "void cxxbridge1$weak_ptr${}$null(::std::weak_ptr<{}> *ptr) noexcept {{",
+        instance, inner,
+    );
+    writeln!(out, "  ::new (ptr) ::std::weak_ptr<{}>();", inner);
+    writeln!(out, "}}");
+    writeln!(
+        out,
+        "void cxxbridge1$weak_ptr${}$clone(const ::std::weak_ptr<{}>& self, ::std::weak_ptr<{}> *ptr) noexcept {{",
+        instance, inner, inner,
+    );
+    writeln!(out, "  ::new (ptr) ::std::weak_ptr<{}>(self);", inner);
+    writeln!(out, "}}");
+    writeln!(
+        out,
+        "void cxxbridge1$weak_ptr${}$downgrade(const ::std::shared_ptr<{}>& shared, ::std::weak_ptr<{}> *weak) noexcept {{",
+        instance, inner, inner,
+    );
+    writeln!(out, "  ::new (weak) ::std::weak_ptr<{}>(shared);", inner);
+    writeln!(out, "}}");
+    writeln!(
+        out,
+        "void cxxbridge1$weak_ptr${}$upgrade(const ::std::weak_ptr<{}>& weak, ::std::shared_ptr<{}> *shared) noexcept {{",
+        instance, inner, inner,
+    );
+    writeln!(
+        out,
+        "  ::new (shared) ::std::shared_ptr<{}>(weak.lock());",
+        inner,
+    );
+    writeln!(out, "}}");
+    writeln!(
+        out,
+        "void cxxbridge1$weak_ptr${}$drop(::std::weak_ptr<{}> *self) noexcept {{",
+        instance, inner,
+    );
+    writeln!(out, "  self->~weak_ptr();");
+    writeln!(out, "}}");
+}
+
+fn write_cxx_vector(out: &mut OutFile, key: NamedImplKey) {
+    let element = key.rust;
+    let inner = element.to_typename(out.types);
+    let instance = element.to_mangled(out.types);
+
+    out.include.cstddef = true;
+
+    writeln!(
+        out,
+        "::std::size_t cxxbridge1$std$vector${}$size(const ::std::vector<{}> &s) noexcept {{",
         instance, inner,
     );
     writeln!(out, "  return s.size();");
     writeln!(out, "}}");
     writeln!(
         out,
-        "const {} *cxxbridge05$std$vector${}$get_unchecked(const ::std::vector<{}> &s, size_t pos) noexcept {{",
+        "{} *cxxbridge1$std$vector${}$get_unchecked(::std::vector<{}> *s, ::std::size_t pos) noexcept {{",
         inner, instance, inner,
     );
-    writeln!(out, "  return &s[pos];");
+    writeln!(out, "  return &(*s)[pos];");
     writeln!(out, "}}");
 
-    write_unique_ptr_common(out, vector_ty);
-
-    writeln!(out, "#endif // CXXBRIDGE05_VECTOR_{}", instance);
+    out.include.memory = true;
+    write_unique_ptr_common(out, UniquePtr::CxxVector(element));
 }

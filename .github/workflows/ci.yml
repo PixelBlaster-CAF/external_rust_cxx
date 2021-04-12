@@ -16,7 +16,7 @@ jobs:
           - rust: nightly
           - rust: beta
           - rust: stable
-          - rust: 1.43.0
+          - rust: 1.48.0
           - name: macOS
             rust: nightly
             os: macos
@@ -26,6 +26,10 @@ jobs:
           - name: Windows (msvc)
             rust: nightly-x86_64-pc-windows-msvc
             os: windows
+            flags: /EHsc
+    env:
+      CXXFLAGS: ${{matrix.flags}}
+      RUSTFLAGS: --cfg deny_warnings
     steps:
       - name: Enable symlinks (windows)
         if: matrix.os == 'windows'
@@ -42,7 +46,8 @@ jobs:
         # still ensure the test is kept passing on the basis of the scheduled
         # builds.
         if: matrix.os && github.event_name != 'schedule'
-        run: echo '::set-env name=RUSTFLAGS::--cfg skip_ui_tests'
+        run: echo "RUSTFLAGS=--cfg skip_ui_tests $RUSTFLAGS" >> $GITHUB_ENV
+        shell: bash
       - run: cargo run --manifest-path demo/Cargo.toml
       - run: cargo test --workspace --exclude cxx-test-suite
 
@@ -63,7 +68,7 @@ jobs:
           chmod +x bin/buck
           echo bin >> $GITHUB_PATH
       - name: Install lld
-        run: sudo apt install lld
+        run: sudo apt-get install lld
       - name: Vendor dependencies
         run: |
           cp third-party/Cargo.lock .
@@ -79,7 +84,7 @@ jobs:
       - uses: actions/checkout@v2
       - name: Install Bazel
         run: |
-          wget -q -O install.sh https://github.com/bazelbuild/bazel/releases/download/2.1.1/bazel-2.1.1-installer-linux-x86_64.sh
+          wget -q -O install.sh https://github.com/bazelbuild/bazel/releases/download/4.0.0/bazel-4.0.0-installer-linux-x86_64.sh
           chmod +x install.sh
           ./install.sh --user
           echo $HOME/bin >> $GITHUB_PATH
@@ -89,7 +94,19 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v2
       - uses: dtolnay/rust-toolchain@clippy
       - run: cargo clippy --workspace --tests -- -Dclippy::all
+
+  clang-tidy:
+    name: Clang Tidy
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v2
+      - name: Install clang-tidy
+        run: sudo apt-get install clang-tidy-11
+      - name: Run clang-tidy
+        run: clang-tidy-11 src/cxx.cc --warnings-as-errors=*

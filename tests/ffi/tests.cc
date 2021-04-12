@@ -1,11 +1,13 @@
 #include "tests/ffi/tests.h"
 #include "tests/ffi/lib.rs.h"
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 
 extern "C" void cxx_test_suite_set_correct() noexcept;
 extern "C" tests::R *cxx_test_suite_get_box() noexcept;
@@ -21,21 +23,30 @@ size_t C::get() const { return this->n; }
 
 size_t C::get2() const { return this->n; }
 
+const size_t &C::getRef() const { return this->n; }
+
+size_t &C::getMut() { return this->n; }
+
 size_t C::set(size_t n) {
   this->n = n;
   return this->n;
 }
 
-size_t C::set2(size_t n) {
-  this->n = n;
-  return this->n;
-}
-
-size_t C::set_succeed(size_t n) { return this->set2(n); }
+size_t C::set_succeed(size_t n) { return this->set(n); }
 
 size_t C::get_fail() { throw std::runtime_error("unimplemented"); }
 
 size_t Shared::c_method_on_shared() const noexcept { return 2021; }
+
+const size_t &Shared::c_method_ref_on_shared() const noexcept {
+  return this->z;
+}
+
+size_t &Shared::c_method_mut_on_shared() noexcept { return this->z; }
+
+void Array::c_set_array(int32_t val) noexcept {
+  this->a = {val, val, val, val};
+}
 
 const std::vector<uint8_t> &C::get_v() const { return this->v; }
 
@@ -50,11 +61,23 @@ Shared c_return_shared() { return Shared{2020}; }
 ::A::B::ABShared c_return_nested_ns_shared() { return ::A::B::ABShared{2020}; }
 
 rust::Box<R> c_return_box() {
+  Shared shared{0};
+  rust::Box<Shared> box{shared}; // explicit constructor from const T&
+  rust::Box<Shared> other{std::move(shared)}; // explicit constructor from T&&
+  box = std::move(other);                     // move assignment
+  rust::Box<Shared> box2(*box);               // copy from another Box
+  rust::Box<Shared> other2(std::move(other)); // move constructor
+  rust::Box<Shared>::in_place(shared.z);      // placement static factory
+  rust::Box<Shared>::in_place<size_t>(0);
   return rust::Box<R>::from_raw(cxx_test_suite_get_box());
 }
 
 std::unique_ptr<C> c_return_unique_ptr() {
   return std::unique_ptr<C>(new C{2020});
+}
+
+std::shared_ptr<C> c_return_shared_ptr() {
+  return std::shared_ptr<C>(new C{2020});
 }
 
 std::unique_ptr<::H::H> c_return_ns_unique_ptr() {
@@ -76,10 +99,13 @@ rust::Str c_return_str(const Shared &shared) {
   return "2020";
 }
 
-rust::Slice<uint8_t> c_return_sliceu8(const Shared &shared) {
+rust::Slice<const char> c_return_slice_char(const Shared &shared) {
   (void)shared;
-  return rust::Slice<uint8_t>(reinterpret_cast<const uint8_t *>(SLICE_DATA),
-                              sizeof(SLICE_DATA));
+  return rust::Slice<const char>(SLICE_DATA, sizeof(SLICE_DATA));
+}
+
+rust::Slice<uint8_t> c_return_mutsliceu8(rust::Slice<uint8_t> slice) {
+  return slice;
 }
 
 rust::String c_return_rust_string() { return "2020"; }
@@ -129,7 +155,8 @@ const std::vector<uint8_t> &c_return_ref_vector(const C &c) {
 std::vector<uint8_t> &c_return_mut_vector(C &c) { return c.get_v(); }
 
 rust::Vec<uint8_t> c_return_rust_vec() {
-  throw std::runtime_error("unimplemented");
+  rust::Vec<uint8_t> vec{2, 0, 2, 0};
+  return vec;
 }
 
 const rust::Vec<uint8_t> &c_return_ref_rust_vec(const C &c) {
@@ -143,7 +170,7 @@ rust::Vec<uint8_t> &c_return_mut_rust_vec(C &c) {
 }
 
 rust::Vec<rust::String> c_return_rust_vec_string() {
-  throw std::runtime_error("unimplemented");
+  return {"2", "0", "2", "0"};
 }
 
 size_t c_return_identity(size_t n) { return n; }
@@ -178,6 +205,20 @@ Enum c_return_enum(uint16_t n) {
   } else {
     return ::A::B::ABEnum::ABCVal;
   }
+}
+
+const C *c_return_const_ptr(size_t c) { return new C(c); }
+
+C *c_return_mut_ptr(size_t c) { return new C(c); }
+
+Borrow::Borrow(const std::string &s) : s(s) {}
+
+void Borrow::const_member() const {}
+
+void Borrow::nonconst_member() {}
+
+std::unique_ptr<Borrow> c_return_borrow(const std::string &s) {
+  return std::unique_ptr<Borrow>(new Borrow(s));
 }
 
 void c_take_primitive(size_t n) {
@@ -240,9 +281,44 @@ void c_take_str(rust::Str s) {
   }
 }
 
-void c_take_sliceu8(rust::Slice<uint8_t> s) {
-  if (std::string(reinterpret_cast<const char *>(s.data()), s.size()) ==
-      "2020") {
+void c_take_slice_char(rust::Slice<const char> s) {
+  if (std::string(s.data(), s.size()) == "2020") {
+    cxx_test_suite_set_correct();
+  }
+}
+
+void c_take_slice_shared(rust::Slice<const Shared> s) {
+  if (s.size() == 2 && s.data()->z == 2020 && s[1].z == 2021 &&
+      s.at(1).z == 2021 && s.front().z == 2020 && s.back().z == 2021) {
+    cxx_test_suite_set_correct();
+  }
+}
+
+void c_take_slice_shared_sort(rust::Slice<Shared> s) {
+  // Exercise requirements of RandomAccessIterator.
+  // https://en.cppreference.com/w/cpp/named_req/RandomAccessIterator
+  std::sort(s.begin(), s.end());
+  if (s[0].z == 0 && s[1].z == 2 && s[2].z == 4 && s[3].z == 7) {
+    cxx_test_suite_set_correct();
+  }
+}
+
+void c_take_slice_r(rust::Slice<const R> s) {
+  if (s.size() == 3 && s[0].get() == 2020 && s[1].get() == 2050) {
+    cxx_test_suite_set_correct();
+  }
+}
+
+bool operator<(const R &a, const R &b) noexcept { return a.get() < b.get(); }
+
+void c_take_slice_r_sort(rust::Slice<R> s) {
+  std::qsort(s.data(), s.size(), rust::size_of<decltype(s)::value_type>(),
+             [](const void *fst, const void *snd) {
+               auto &a = *static_cast<const R *>(fst);
+               auto &b = *static_cast<const R *>(snd);
+               return a < b ? -1 : b < a ? 1 : 0;
+             });
+  if (s[0].get() == 2020 && s[1].get() == 2021 && s[2].get() == 2050) {
     cxx_test_suite_set_correct();
   }
 }
@@ -340,11 +416,23 @@ void c_take_rust_vec_string(rust::Vec<rust::String> v) {
 void c_take_rust_vec_shared_forward_iterator(rust::Vec<Shared> v) {
   // Exercise requirements of ForwardIterator
   // https://en.cppreference.com/w/cpp/named_req/ForwardIterator
-  uint32_t sum = 0;
+  uint32_t sum = 0, csum = 0;
   for (auto it = v.begin(), it_end = v.end(); it != it_end; it++) {
     sum += it->z;
   }
-  if (sum == 2021) {
+  for (auto it = v.cbegin(), it_end = v.cend(); it != it_end; it++) {
+    csum += it->z;
+  }
+  if (sum == 2021 && csum == 2021) {
+    cxx_test_suite_set_correct();
+  }
+}
+
+void c_take_rust_vec_shared_sort(rust::Vec<Shared> v) {
+  // Exercise requirements of RandomAccessIterator.
+  // https://en.cppreference.com/w/cpp/named_req/RandomAccessIterator
+  std::sort(v.begin(), v.end());
+  if (v[0].z == 0 && v[1].z == 2 && v[2].z == 4 && v[3].z == 7) {
     cxx_test_suite_set_correct();
   }
 }
@@ -424,6 +512,14 @@ void c_take_nested_ns_enum(::A::B::ABEnum e) {
   }
 }
 
+size_t c_take_const_ptr(const C *c) { return c->get(); }
+
+size_t c_take_mut_ptr(C *c) {
+  size_t result = c->get();
+  delete c;
+  return result;
+}
+
 void c_try_return_void() {}
 
 size_t c_try_return_primitive() { return 2020; }
@@ -436,7 +532,13 @@ const rust::String &c_try_return_ref(const rust::String &s) { return s; }
 
 rust::Str c_try_return_str(rust::Str s) { return s; }
 
-rust::Slice<uint8_t> c_try_return_sliceu8(rust::Slice<uint8_t> s) { return s; }
+rust::Slice<const uint8_t> c_try_return_sliceu8(rust::Slice<const uint8_t> s) {
+  return s;
+}
+
+rust::Slice<uint8_t> c_try_return_mutsliceu8(rust::Slice<uint8_t> s) {
+  return s;
+}
 
 rust::String c_try_return_rust_string() { return c_return_rust_string(); }
 
@@ -457,8 +559,17 @@ const rust::Vec<uint8_t> &c_try_return_ref_rust_vec(const C &c) {
   throw std::runtime_error("unimplemented");
 }
 
+size_t c_get_use_count(const std::weak_ptr<C> &weak) noexcept {
+  return weak.use_count();
+}
+
 extern "C" C *cxx_test_suite_get_unique_ptr() noexcept {
   return std::unique_ptr<C>(new C{2020}).release();
+}
+
+extern "C" void
+cxx_test_suite_get_shared_ptr(std::shared_ptr<C> *repr) noexcept {
+  new (repr) std::shared_ptr<C>(new C{2020});
 }
 
 extern "C" std::string *cxx_test_suite_get_unique_ptr_string() noexcept {
@@ -489,6 +600,24 @@ void c_take_trivial_ptr(std::unique_ptr<D> d) {
 
 void c_take_trivial_ref(const D &d) {
   if (d.d == 30) {
+    cxx_test_suite_set_correct();
+  }
+}
+
+void c_take_trivial_mut_ref(D &d) { (void)d; }
+
+void c_take_trivial_pin_ref(const D &d) { (void)d; }
+
+void c_take_trivial_pin_mut_ref(D &d) { (void)d; }
+
+void D::c_take_trivial_ref_method() const {
+  if (d == 30) {
+    cxx_test_suite_set_correct();
+  }
+}
+
+void D::c_take_trivial_mut_ref_method() {
+  if (d == 30) {
     cxx_test_suite_set_correct();
   }
 }
@@ -535,6 +664,18 @@ void c_take_opaque_ref(const E &e) {
   }
 }
 
+void E::c_take_opaque_ref_method() const {
+  if (e == 40 && e_str == "hello") {
+    cxx_test_suite_set_correct();
+  }
+}
+
+void E::c_take_opaque_mut_ref_method() {
+  if (e == 40 && e_str == "hello") {
+    cxx_test_suite_set_correct();
+  }
+}
+
 void c_take_opaque_ns_ref(const ::F::F &f) {
   if (f.f == 40 && f.f_str == "hello") {
     cxx_test_suite_set_correct();
@@ -572,6 +713,8 @@ std::unique_ptr<E> c_return_opaque_ptr() {
   return e;
 }
 
+E &c_return_opaque_mut_pin(E &e) { return e; }
+
 std::unique_ptr<::F::F> c_return_ns_opaque_ptr() {
   auto f = std::unique_ptr<::F::F>(new ::F::F());
   f->f = 40;
@@ -589,10 +732,16 @@ extern "C" const char *cxx_run_test() noexcept {
     }                                                                          \
   } while (false)
 
+  ASSERT(rust::size_of<R>() == sizeof(size_t));
+  ASSERT(rust::align_of<R>() == alignof(size_t));
+  ASSERT(rust::size_of<size_t>() == sizeof(size_t));
+  ASSERT(rust::align_of<size_t>() == alignof(size_t));
+
   ASSERT(r_return_primitive() == 2020);
   ASSERT(r_return_shared().z == 2020);
   ASSERT(cxx_test_suite_r_is_correct(&*r_return_box()));
   ASSERT(r_return_unique_ptr()->get() == 2020);
+  ASSERT(r_return_shared_ptr()->get() == 2020);
   ASSERT(r_return_ref(Shared{2020}) == 2020);
   ASSERT(std::string(r_return_str(Shared{2020})) == "2020");
   ASSERT(std::string(r_return_rust_string()) == "2020");
@@ -606,10 +755,10 @@ extern "C" const char *cxx_run_test() noexcept {
   r_take_primitive(2020);
   r_take_shared(Shared{2020});
   r_take_unique_ptr(std::unique_ptr<C>(new C{2020}));
+  r_take_shared_ptr(std::shared_ptr<C>(new C{2020}));
   r_take_ref_c(C{2020});
   r_take_str(rust::Str("2020"));
-  r_take_sliceu8(rust::Slice<uint8_t>(
-      reinterpret_cast<const uint8_t *>(SLICE_DATA), sizeof(SLICE_DATA)));
+  r_take_slice_char(rust::Slice<const char>(SLICE_DATA, sizeof(SLICE_DATA)));
   r_take_rust_string(rust::String("2020"));
   r_take_unique_ptr_string(
       std::unique_ptr<std::string>(new std::string("2020")));
@@ -628,15 +777,73 @@ extern "C" const char *cxx_run_test() noexcept {
     ASSERT(std::strcmp(e.what(), "rust error") == 0);
   }
 
-  auto r2 = r_return_r2(2020);
-  ASSERT(r2->get() == 2020);
-  ASSERT(r2->set(2021) == 2021);
+  auto r = r_return_box();
+  ASSERT(r->get() == 2020);
+  ASSERT(r->set(2021) == 2021);
+  ASSERT(r->get() == 2021);
+
+  using std::swap;
+  auto r2 = r_return_box();
+  swap(r, r2);
+  ASSERT(r->get() == 2020);
   ASSERT(r2->get() == 2021);
-  ASSERT(r2->set(2020) == 2020);
-  ASSERT(r2->get() == 2020);
+
   ASSERT(std::string(Shared{0}.r_method_on_shared()) == "2020");
 
   ASSERT(std::string(rAliasedFunction(2020)) == "2020");
+
+  ASSERT(Shared{1} == Shared{1});
+  ASSERT(Shared{1} != Shared{2});
+
+  rust::String first = "first", second = "second", sec = "sec";
+  bool (rust::String::*cmp)(const rust::String &) const;
+  bool first_first, first_second, sec_second, second_sec;
+  for (auto test : {
+           std::tuple<decltype(cmp), bool, bool, bool, bool>{
+               &rust::String::operator==, true, false, false, false},
+           {&rust::String::operator!=, false, true, true, true},
+           {&rust::String::operator<, false, true, true, false},
+           {&rust::String::operator<=, true, true, true, false},
+           {&rust::String::operator>, false, false, false, true},
+           {&rust::String::operator>=, true, false, false, true},
+       }) {
+    std::tie(cmp, first_first, first_second, sec_second, second_sec) = test;
+    ASSERT((first.*cmp)(first) == first_first);
+    ASSERT((first.*cmp)(second) == first_second);
+    ASSERT((sec.*cmp)(second) == sec_second);
+    ASSERT((second.*cmp)(sec) == second_sec);
+  }
+
+  rust::String cstring = "test";
+  ASSERT(cstring.length() == 4);
+  ASSERT(strncmp(cstring.data(), "test", 4) == 0);
+  ASSERT(strncmp(cstring.c_str(), "test", 5) == 0);
+  ASSERT(cstring.length() == 4);
+
+  rust::String other_cstring = "foo";
+  swap(cstring, other_cstring);
+  ASSERT(cstring == "foo");
+  ASSERT(other_cstring == "test");
+
+  rust::Str cstr = "test";
+  rust::Str other_cstr = "foo";
+  swap(cstr, other_cstr);
+  ASSERT(cstr == "foo");
+  ASSERT(other_cstr == "test");
+
+  rust::Vec<int> vec1{1, 2};
+  rust::Vec<int> vec2{3, 4};
+  swap(vec1, vec2);
+  ASSERT(vec1[0] == 3 && vec1[1] == 4);
+  ASSERT(vec2[0] == 1 && vec2[1] == 2);
+
+  // Test Vec<usize> and Vec<isize>. These are weird because on Linux and
+  // Windows size_t is exactly the same C++ type as one of the sized integer
+  // types (typically uint64_t, both of which are defined as unsigned long),
+  // while on macOS it is a distinct type.
+  // https://github.com/dtolnay/cxx/issues/705
+  (void)rust::Vec<size_t>();
+  (void)rust::Vec<rust::isize>();
 
   cxx_test_suite_set_correct();
   return nullptr;
@@ -671,3 +878,25 @@ std::unique_ptr<I> ns_c_return_unique_ptr_ns() {
   return std::unique_ptr<I>(new I());
 }
 } // namespace I
+
+// Instantiate any remaining class member functions not already covered above.
+// This is an easy way to at least typecheck anything missed by unit tests.
+// https://en.cppreference.com/w/cpp/language/class_template#Explicit_instantiation
+// > When an explicit instantiation names a class template specialization, it
+// > serves as an explicit instantiation of the same kind (declaration or
+// > definition) of each of its non-inherited non-template members that has not
+// > been previously explicitly specialized in the translation unit.
+#if defined(CXX_TEST_INSTANTIATIONS)
+template class rust::Box<tests::Shared>;
+template class rust::Slice<const char>;
+template class rust::Slice<const uint8_t>;
+template class rust::Slice<uint8_t>;
+template class rust::Slice<const tests::Shared>;
+template class rust::Slice<tests::Shared>;
+template class rust::Slice<const tests::R>;
+template class rust::Slice<tests::R>;
+template class rust::Vec<uint8_t>;
+template class rust::Vec<rust::String>;
+template class rust::Vec<tests::Shared>;
+template class rust::Fn<size_t(rust::String)>;
+#endif

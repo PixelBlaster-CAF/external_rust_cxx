@@ -1,10 +1,8 @@
 load(
     "//tools/bazel:rust.bzl",
     glob = "third_party_glob",
-    rust_binary = "third_party_rust_binary",
     rust_library = "third_party_rust_library",
 )
-load("@bazel_tools//tools/build_defs/pkg:pkg.bzl", "pkg_tar")
 
 rust_library(
     name = "bitflags",
@@ -13,7 +11,7 @@ rust_library(
 
 rust_library(
     name = "cc",
-    srcs = glob(["vendor/cc-1.0.62/src/**"]),
+    srcs = glob(["vendor/cc-1.0.67/src/**"]),
     visibility = ["//visibility:public"],
 )
 
@@ -31,7 +29,7 @@ rust_library(
 
 rust_library(
     name = "codespan-reporting",
-    srcs = glob(["vendor/codespan-reporting-0.9.5/src/**"]),
+    srcs = glob(["vendor/codespan-reporting-0.11.1/src/**"]),
     visibility = ["//visibility:public"],
     deps = [
         ":termcolor",
@@ -47,7 +45,7 @@ rust_library(
 
 rust_library(
     name = "proc-macro2",
-    srcs = glob(["vendor/proc-macro2-1.0.24/src/**"]),
+    srcs = glob(["vendor/proc-macro2-1.0.26/src/**"]),
     crate_features = [
         "proc-macro",
         "span-locations",
@@ -63,7 +61,7 @@ rust_library(
 
 rust_library(
     name = "quote",
-    srcs = glob(["vendor/quote-1.0.7/src/**"]),
+    srcs = glob(["vendor/quote-1.0.9/src/**"]),
     crate_features = ["proc-macro"],
     visibility = ["//visibility:public"],
     deps = [":proc-macro2"],
@@ -78,7 +76,7 @@ rust_library(
 
 rust_library(
     name = "syn",
-    srcs = glob(["vendor/syn-1.0.48/src/**"]),
+    srcs = glob(["vendor/syn-1.0.68/src/**"]),
     crate_features = [
         "clone-impls",
         "derive",
@@ -97,7 +95,7 @@ rust_library(
 
 rust_library(
     name = "termcolor",
-    srcs = glob(["vendor/termcolor-1.1.0/src/**"]),
+    srcs = glob(["vendor/termcolor-1.1.2/src/**"]),
 )
 
 rust_library(
