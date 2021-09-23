@@ -43,6 +43,8 @@ public:
   String(const std::string &);
   String(const char *);
   String(const char *, std::size_t);
+  String(const char16_t *);
+  String(const char16_t *, std::size_t);
 
   String &operator=(const String &) &noexcept;
   String &operator=(String &&) &noexcept;
@@ -53,6 +55,7 @@ public:
   const char *data() const noexcept;
   std::size_t size() const noexcept;
   std::size_t length() const noexcept;
+  bool empty() const noexcept;
 
   const char *c_str() noexcept;
 
@@ -105,6 +108,7 @@ public:
   const char *data() const noexcept;
   std::size_t size() const noexcept;
   std::size_t length() const noexcept;
+  bool empty() const noexcept;
 
   // Important in order for System V ABI to pass in registers.
   Str(const Str &) noexcept = default;
@@ -475,7 +479,7 @@ void panic [[noreturn]] (const char *msg);
 #define CXXBRIDGE1_RUST_FN
 template <typename Ret, typename... Args>
 Ret Fn<Ret(Args...)>::operator()(Args... args) const noexcept {
-  return (*this->trampoline)(std::move(args)..., this->fn);
+  return (*this->trampoline)(std::forward<Args>(args)..., this->fn);
 }
 
 template <typename Ret, typename... Args>

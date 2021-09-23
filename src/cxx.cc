@@ -31,8 +31,10 @@ void cxxbridge1$cxx_string$push(std::string &s, const std::uint8_t *ptr,
 void cxxbridge1$string$new(rust::String *self) noexcept;
 void cxxbridge1$string$clone(rust::String *self,
                              const rust::String &other) noexcept;
-bool cxxbridge1$string$from(rust::String *self, const char *ptr,
-                            std::size_t len) noexcept;
+bool cxxbridge1$string$from_utf8(rust::String *self, const char *ptr,
+                                 std::size_t len) noexcept;
+bool cxxbridge1$string$from_utf16(rust::String *self, const char16_t *ptr,
+                                  std::size_t len) noexcept;
 void cxxbridge1$string$drop(rust::String *self) noexcept;
 const char *cxxbridge1$string$ptr(const rust::String *self) noexcept;
 std::size_t cxxbridge1$string$len(const rust::String *self) noexcept;
@@ -81,8 +83,14 @@ String::String(String &&other) noexcept : repr(other.repr) {
 String::~String() noexcept { cxxbridge1$string$drop(this); }
 
 static void initString(String *self, const char *s, std::size_t len) {
-  if (!cxxbridge1$string$from(self, s, len)) {
+  if (!cxxbridge1$string$from_utf8(self, s, len)) {
     panic<std::invalid_argument>("data for rust::String is not utf-8");
+  }
+}
+
+static void initString(String *self, const char16_t *s, std::size_t len) {
+  if (!cxxbridge1$string$from_utf16(self, s, len)) {
+    panic<std::invalid_argument>("data for rust::String is not utf-16");
   }
 }
 
@@ -97,6 +105,19 @@ String::String(const char *s, std::size_t len) {
   assert(s != nullptr || len == 0);
   initString(this,
              s == nullptr && len == 0 ? reinterpret_cast<const char *>(1) : s,
+             len);
+}
+
+String::String(const char16_t *s) {
+  assert(s != nullptr);
+  initString(this, s, std::char_traits<char16_t>::length(s));
+}
+
+String::String(const char16_t *s, std::size_t len) {
+  assert(s != nullptr || len == 0);
+  initString(this,
+             s == nullptr && len == 0 ? reinterpret_cast<const char16_t *>(2)
+                                      : s,
              len);
 }
 
@@ -130,6 +151,8 @@ std::size_t String::size() const noexcept {
 std::size_t String::length() const noexcept {
   return cxxbridge1$string$len(this);
 }
+
+bool String::empty() const noexcept { return this->size() == 0; }
 
 const char *String::c_str() noexcept {
   auto len = this->length();
@@ -227,6 +250,8 @@ const char *Str::data() const noexcept { return cxxbridge1$str$ptr(this); }
 std::size_t Str::size() const noexcept { return cxxbridge1$str$len(this); }
 
 std::size_t Str::length() const noexcept { return this->size(); }
+
+bool Str::empty() const noexcept { return this->size() == 0; }
 
 Str::const_iterator Str::begin() const noexcept { return this->cbegin(); }
 
@@ -427,6 +452,13 @@ using isize_if_unique =
 } // namespace cxxbridge1
 } // namespace rust
 
+namespace {
+template <typename T>
+void destroy(T *ptr) {
+  ptr->~T();
+}
+} // namespace
+
 extern "C" {
 void cxxbridge1$unique_ptr$std$string$null(
     std::unique_ptr<std::string> *ptr) noexcept {
@@ -489,6 +521,18 @@ static_assert(sizeof(std::string) <= kMaxExpectedWordsInString * sizeof(void *),
   void cxxbridge1$unique_ptr$std$vector$##RUST_TYPE##$drop(                    \
       std::unique_ptr<std::vector<CXX_TYPE>> *ptr) noexcept {                  \
     ptr->~unique_ptr();                                                        \
+  }
+
+#define STD_VECTOR_TRIVIAL_OPS(RUST_TYPE, CXX_TYPE)                            \
+  void cxxbridge1$std$vector$##RUST_TYPE##$push_back(                          \
+      std::vector<CXX_TYPE> *v, CXX_TYPE *value) noexcept {                    \
+    v->push_back(std::move(*value));                                           \
+    destroy(value);                                                            \
+  }                                                                            \
+  void cxxbridge1$std$vector$##RUST_TYPE##$pop_back(std::vector<CXX_TYPE> *v,  \
+                                                    CXX_TYPE *out) noexcept {  \
+    new (out) CXX_TYPE(std::move(v->back()));                                  \
+    v->pop_back();                                                             \
   }
 
 #define RUST_VEC_EXTERNS(RUST_TYPE, CXX_TYPE)                                  \
@@ -603,10 +647,13 @@ static_assert(sizeof(std::string) <= kMaxExpectedWordsInString * sizeof(void *),
   MACRO(f32, float)                                                            \
   MACRO(f64, double)
 
-#define FOR_EACH_STD_VECTOR(MACRO)                                             \
+#define FOR_EACH_TRIVIAL_STD_VECTOR(MACRO)                                     \
   FOR_EACH_NUMERIC(MACRO)                                                      \
   MACRO(usize, std::size_t)                                                    \
-  MACRO(isize, rust::isize)                                                    \
+  MACRO(isize, rust::isize)
+
+#define FOR_EACH_STD_VECTOR(MACRO)                                             \
+  FOR_EACH_TRIVIAL_STD_VECTOR(MACRO)                                           \
   MACRO(string, std::string)
 
 #define FOR_EACH_RUST_VEC(MACRO)                                               \
@@ -627,6 +674,7 @@ static_assert(sizeof(std::string) <= kMaxExpectedWordsInString * sizeof(void *),
 
 extern "C" {
 FOR_EACH_STD_VECTOR(STD_VECTOR_OPS)
+FOR_EACH_TRIVIAL_STD_VECTOR(STD_VECTOR_TRIVIAL_OPS)
 FOR_EACH_RUST_VEC(RUST_VEC_EXTERNS)
 FOR_EACH_SHARED_PTR(SHARED_PTR_OPS)
 } // extern "C"

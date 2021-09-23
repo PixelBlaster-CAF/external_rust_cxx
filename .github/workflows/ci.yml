@@ -54,6 +54,7 @@ jobs:
   buck:
     name: Buck
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v2
       - uses: dtolnay/rust-toolchain@stable
@@ -80,6 +81,7 @@ jobs:
   bazel:
     name: Bazel
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v2
       - name: Install Bazel
@@ -94,7 +96,8 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
+    #if: github.event_name != 'pull_request'
+    if: false  # Clippy crash: https://github.com/rust-lang/rust-clippy/issues/7423
     steps:
       - uses: actions/checkout@v2
       - uses: dtolnay/rust-toolchain@clippy

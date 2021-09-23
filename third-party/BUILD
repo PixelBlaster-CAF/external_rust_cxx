@@ -11,7 +11,7 @@ rust_library(
 
 rust_library(
     name = "cc",
-    srcs = glob(["vendor/cc-1.0.67/src/**"]),
+    srcs = glob(["vendor/cc-1.0.69/src/**"]),
     visibility = ["//visibility:public"],
 )
 
@@ -45,7 +45,7 @@ rust_library(
 
 rust_library(
     name = "proc-macro2",
-    srcs = glob(["vendor/proc-macro2-1.0.26/src/**"]),
+    srcs = glob(["vendor/proc-macro2-1.0.28/src/**"]),
     crate_features = [
         "proc-macro",
         "span-locations",
@@ -76,7 +76,7 @@ rust_library(
 
 rust_library(
     name = "syn",
-    srcs = glob(["vendor/syn-1.0.68/src/**"]),
+    srcs = glob(["vendor/syn-1.0.74/src/**"]),
     crate_features = [
         "clone-impls",
         "derive",
@@ -111,5 +111,5 @@ rust_library(
 
 rust_library(
     name = "unicode-xid",
-    srcs = glob(["vendor/unicode-xid-0.2.1/src/**"]),
+    srcs = glob(["vendor/unicode-xid-0.2.2/src/**"]),
 )
