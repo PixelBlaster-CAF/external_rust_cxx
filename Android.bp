@@ -63,6 +63,7 @@ rust_library {
 cc_library_static {
     host_supported: true,
     name: "libcxxbridge05",
+    defaults: ["rust_static_cc_lib_defaults"],
     cflags: ["-DRUST_CXX_NO_EXCEPTIONS"],
     srcs: ["src/cxx.cc"],
     apex_available: [
